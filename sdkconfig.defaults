@@ -18,8 +18,8 @@ CONFIG_BT_ENABLED=n
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 # 断言保留但不打印文件名/行号字符串(省 rodata)
 CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y
-# 证书包用常用 CA 子集(覆盖 Let's Encrypt/DigiCert 等主流 CA，比完整包省 ~50KB+)
-CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
+# 证书包用完整 CA 集：flash 尚有 30%+ 余量，避免小众推送服务因 CA 缺失握手失败
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 # 本固件只用 IPv4(推送/SMTP/NTP/captive DNS 均为 v4)，关 IPv6 省 flash+RAM
 CONFIG_LWIP_IPV6=n
 # 无终端应用，不需要 termios
@@ -38,11 +38,10 @@ CONFIG_RINGBUF_PLACE_FUNCTIONS_INTO_FLASH=y
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
 CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT=y
-# Web UI 为轻量单用户场景，收/发动态缓冲 32→16 降低突发内存峰值
-CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
-CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
-
 # ---- 可靠性 ----
+# 多浏览器标签页 + mDNS/SNTP/推送/SMTP 并存时默认 10 个 socket 会耗尽，
+# 表现为新页面打不开、旧页面轮询卡死。每个 socket 静态开销仅几百字节
+CONFIG_LWIP_MAX_SOCKETS=20
 # NTP 主服务器 + 2 个兜底(idf_wifi 里注册)，单服务器不可达时时间同步不再瘫痪
 CONFIG_LWIP_SNTP_MAX_SERVERS=3
 # 分区表本来就保留了 64KB coredump 分区，启用崩溃转储，无人值守设备排障必备

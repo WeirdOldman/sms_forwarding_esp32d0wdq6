@@ -43,6 +43,7 @@ static constexpr uint32_t IDENTITY_RETRY_INTERVAL_MS = 600000UL;
 static constexpr uint32_t SIGNAL_INTERVAL_WEB_MS = 10000UL;
 static constexpr uint32_t SIGNAL_DETAIL_INTERVAL_WEB_MS = 30000UL;
 static constexpr int64_t WEB_POLL_ACTIVE_WINDOW_US = 15LL * 1000LL * 1000LL;
+static constexpr size_t URC_BUFFER_MAX = 4096;
 
 static SemaphoreHandle_t s_at_mutex = nullptr;
 static SemaphoreHandle_t s_status_mutex = nullptr;
@@ -69,6 +70,27 @@ static bool s_identity_network_attempted = false;
 static std::atomic<int64_t> s_last_web_poll_us{-WEB_POLL_ACTIVE_WINDOW_US};
 
 void idf_modem_signal_event(void);
+
+static void cleanup_start_resources()
+{
+    if (s_at_mutex) {
+        vSemaphoreDelete(s_at_mutex);
+        s_at_mutex = nullptr;
+    }
+    if (s_status_mutex) {
+        vSemaphoreDelete(s_status_mutex);
+        s_status_mutex = nullptr;
+    }
+    if (s_urc_mutex) {
+        vSemaphoreDelete(s_urc_mutex);
+        s_urc_mutex = nullptr;
+    }
+    if (s_event_sem) {
+        vSemaphoreDelete(s_event_sem);
+        s_event_sem = nullptr;
+    }
+    s_urc_buffer.clear();
+}
 
 static std::string trim(std::string value)
 {
@@ -304,10 +326,22 @@ static void append_urc_text(const std::string& text)
 {
     if (text.empty() || !s_urc_mutex) return;
     if (xSemaphoreTake(s_urc_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
-    if (s_urc_buffer.size() + text.size() > 4096) {
-        s_urc_buffer.erase(0, std::min<size_t>(s_urc_buffer.size(), text.size()));
+    if (text.size() >= URC_BUFFER_MAX) {
+        // 长 AT 响应里夹 URC 时，整段转存会突破缓冲上限；保留尾部且尽量从完整行开始。
+        size_t start = text.size() - URC_BUFFER_MAX;
+        size_t nl = text.find('\n', start);
+        if (nl != std::string::npos && nl + 1 < text.size()) start = nl + 1;
+        s_urc_buffer.assign(text.data() + start, text.size() - start);
+    } else {
+        size_t need = s_urc_buffer.size() + text.size();
+        if (need > URC_BUFFER_MAX) {
+            size_t drop = need - URC_BUFFER_MAX;
+            s_urc_buffer.erase(0, std::min(drop, s_urc_buffer.size()));
+            size_t nl = s_urc_buffer.find('\n');
+            if (nl != std::string::npos && nl + 1 < s_urc_buffer.size()) s_urc_buffer.erase(0, nl + 1);
+        }
+        s_urc_buffer += text;
     }
-    s_urc_buffer += text;
     xSemaphoreGive(s_urc_mutex);
     idf_modem_signal_event();  // 立即唤醒短信任务处理，不等它的轮询周期
 }
@@ -349,6 +383,18 @@ static bool at_channel_idle_now(void)
     if (xSemaphoreTake(s_at_mutex, 0) != pdTRUE) return false;
     xSemaphoreGive(s_at_mutex);
     return true;
+}
+
+static void append_capped(std::string& out, const uint8_t* data, size_t len, size_t cap)
+{
+    if (!data || len == 0 || cap == 0) return;
+    if (len >= cap) {
+        out.assign(reinterpret_cast<const char*>(data + len - cap), cap);
+        return;
+    }
+    size_t need = out.size() + len;
+    if (need > cap) out.erase(0, need - cap);
+    out.append(reinterpret_cast<const char*>(data), len);
 }
 
 esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response)
@@ -404,24 +450,25 @@ esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uin
 
     response.clear();
     response.reserve(512);
+    constexpr size_t MAX_RESPONSE = 4096;
     TickDeadline deadline(timeout_ms);
     uint8_t buf[128];
+    std::string scan;
     esp_err_t ret = ESP_ERR_TIMEOUT;
     while (!deadline.expired()) {
         int got = uart_read_bytes(MODEM_UART, buf, sizeof(buf), pdMS_TO_TICKS(100));
         if (got > 0) {
-            response.append(reinterpret_cast<const char*>(buf), got);
-            if (response.find(token) != std::string::npos) {
+            append_capped(response, buf, static_cast<size_t>(got), MAX_RESPONSE);
+            scan.append(reinterpret_cast<const char*>(buf), got);
+            if (response.find(token) != std::string::npos || scan.find(token) != std::string::npos) {
                 ret = ESP_OK;
                 break;
             }
-            if (response.find("\r\nERROR\r\n") != std::string::npos ||
-                response.find("\nERROR\r\n") != std::string::npos ||
-                response.find("+CMS ERROR") != std::string::npos ||
-                response.find("+CME ERROR") != std::string::npos) {
+            if (at_final_result(scan) < 0) {
                 ret = ESP_FAIL;
                 break;
             }
+            if (scan.size() > 64) scan.erase(0, scan.size() - 64);
         }
     }
     if (response.find("+CMT:") != std::string::npos ||
@@ -444,22 +491,26 @@ esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint3
 
     response.clear();
     response.reserve(512);
+    constexpr size_t MAX_RESPONSE = 4096;
     uint8_t buf[128];
     TickDeadline prompt_deadline(5000);
     bool got_prompt = false;
     esp_err_t ret = ESP_ERR_TIMEOUT;
+    std::string scan;
     while (!prompt_deadline.expired()) {
         int got = uart_read_bytes(MODEM_UART, buf, sizeof(buf), pdMS_TO_TICKS(80));
         if (got > 0) {
-            response.append(reinterpret_cast<const char*>(buf), got);
-            if (response.find('>') != std::string::npos) {
+            append_capped(response, buf, static_cast<size_t>(got), MAX_RESPONSE);
+            scan.append(reinterpret_cast<const char*>(buf), got);
+            if (response.find('>') != std::string::npos || scan.find('>') != std::string::npos) {
                 got_prompt = true;
                 break;
             }
-            if (response.find("ERROR") != std::string::npos) {
+            if (at_final_result(scan) < 0) {
                 ret = ESP_FAIL;  // 提示符阶段就报错(如未注册的 +CMS ERROR)，按失败而非超时上报
                 break;
             }
+            if (scan.size() > 64) scan.erase(0, scan.size() - 64);
         }
     }
 
@@ -468,15 +519,18 @@ esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint3
         const uint8_t end = 0x1A;  // Ctrl+Z 提交 PDU，ML307R/Arduino 版同样要求
         uart_write_bytes(MODEM_UART, &end, 1);
         TickDeadline deadline(timeout_ms);
+        scan.clear();
         while (!deadline.expired()) {
             int got = uart_read_bytes(MODEM_UART, buf, sizeof(buf), pdMS_TO_TICKS(120));
             if (got > 0) {
-                response.append(reinterpret_cast<const char*>(buf), got);
-                int final_code = at_final_result(response);
+                append_capped(response, buf, static_cast<size_t>(got), MAX_RESPONSE);
+                scan.append(reinterpret_cast<const char*>(buf), got);
+                int final_code = at_final_result(scan);
                 if (final_code != 0) {
                     ret = final_code > 0 ? ESP_OK : ESP_FAIL;
                     break;
                 }
+                if (scan.size() > 64) scan.erase(0, scan.size() - 64);
             }
         }
     }
@@ -548,16 +602,21 @@ static std::string parse_cops(const std::string& resp)
 
 static std::string parse_apn(const std::string& resp)
 {
-    size_t p = resp.find("+CGDCONT:");
-    if (p == std::string::npos) return {};
-    std::string line = line_containing(resp, p);
-    std::string first = first_quoted(line);
-    if (first.empty()) return {};
-    size_t q = line.find('"');
-    if (q == std::string::npos) return {};
-    q = line.find('"', q + 1);
-    if (q == std::string::npos) return {};
-    return first_quoted(line, q + 1);
+    size_t pos = 0;
+    while (true) {
+        size_t p = resp.find("+CGDCONT:", pos);
+        if (p == std::string::npos) return {};
+        std::string line = line_containing(resp, p);
+        size_t q1 = line.find('"');
+        if (q1 != std::string::npos) {
+            size_t q2 = line.find('"', q1 + 1);
+            if (q2 != std::string::npos) {
+                std::string apn = first_quoted(line, q2 + 1);
+                if (!apn.empty()) return apn;
+            }
+        }
+        pos = p + strlen("+CGDCONT:");
+    }
 }
 
 static std::string parse_cnum_phone(const std::string& resp)
@@ -1026,7 +1085,7 @@ static bool model_skips_cgact(void)
     return model == "ML307Y";
 }
 
-static bool apply_configured_data_mode_once(const IdfConfig& cfg, uint32_t active_timeout_ms,
+static bool apply_configured_data_mode_once(const IdfSimSettingsView& cfg, uint32_t active_timeout_ms,
                                             uint32_t inactive_timeout_ms)
 {
     std::string resp;
@@ -1063,7 +1122,7 @@ static void apply_startup_data_mode(void)
         idf_log_line("该型号跳过启动 CGACT 配置");
         return;
     }
-    IdfConfig cfg = idf_config_get();
+    IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
     bool ok = apply_configured_data_mode_once(cfg, 6000, 2500);
     if (ok) {
         idf_log_line(cfg.dataEnabled ? "已按配置启用蜂窝数据(AT+CGACT=1,1)"
@@ -1085,7 +1144,7 @@ static bool plmn_valid(const std::string& plmn)
     return true;
 }
 
-static void apply_operator_if_configured(const IdfConfig& cfg)
+static void apply_operator_if_configured(const IdfSimSettingsView& cfg)
 {
     if (cfg.operatorPlmn.empty()) return;
     if (!plmn_valid(cfg.operatorPlmn)) {
@@ -1108,7 +1167,7 @@ static bool process_data_mode_retry(void)
     if (!at_channel_idle_now()) return false;
 
     ++s_data_mode_retry_count;
-    IdfConfig cfg = idf_config_get();
+    IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
     bool ok = apply_configured_data_mode_once(cfg, 8000, 3000);
     if (ok) {
         s_data_mode_retry_pending = false;
@@ -1194,7 +1253,7 @@ static bool fetch_mhttp_once_locked(const std::string& protocol, const std::stri
     return ok;
 }
 
-esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfConfig& config,
+esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularHttpConfig& config,
                                       IdfCellularHttpResult& result)
 {
     result = IdfCellularHttpResult();
@@ -1450,6 +1509,9 @@ static void configure_sms_and_registration(void)
     }
     send_ok("AT+CNMI=2,1,0,0,0", 1200);
     send_ok("AT+CEREG=2", 1200);
+    // NET 指示灯开关(ML307R: AT+MLED=0,<0/1>)：每次初始化按保存的配置下发，
+    // 覆盖模组记住的上次状态
+    send_ok(idf_config_net_led_enabled() ? "AT+MLED=0,1" : "AT+MLED=0,0", 1200);
 }
 
 // 重启后 AT 握手失败时置位：一旦后续任何探测发现 AT 恢复，立即补跑完整初始化
@@ -1584,7 +1646,7 @@ static void modem_task(void*)
     if (!registered) {
         set_phase("failed");
     } else {
-        IdfConfig cfg = idf_config_get();
+        IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
         apply_operator_if_configured(cfg);
         if (!identity_complete() || !s_identity_network_attempted) sample_identity_once(false, true);
         if (cfg.dataEnabled) sample_cell_ip_once();
@@ -1642,7 +1704,7 @@ static void modem_task(void*)
                     dereg_count = 0;
                     if (!post_register_done) {
                         // 迟到/恢复的注册也要补跑注册后步骤(运营商锁定、网络身份、信号详情)
-                        IdfConfig cfg = idf_config_get();
+                        IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
                         apply_operator_if_configured(cfg);
                         if (!identity_complete() || !s_identity_network_attempted) sample_identity_once(false, true);
                         if (cfg.dataEnabled) sample_cell_ip_once();
@@ -1688,11 +1750,15 @@ static void modem_task(void*)
 esp_err_t idf_modem_start(const IdfConfig& config)
 {
     if (s_started) return ESP_OK;
+    cleanup_start_resources();
     s_at_mutex = xSemaphoreCreateMutex();
     s_status_mutex = xSemaphoreCreateMutex();
     s_urc_mutex = xSemaphoreCreateMutex();
     if (!s_event_sem) s_event_sem = xSemaphoreCreateBinary();
-    if (!s_at_mutex || !s_status_mutex || !s_urc_mutex || !s_event_sem) return ESP_ERR_NO_MEM;
+    if (!s_at_mutex || !s_status_mutex || !s_urc_mutex || !s_event_sem) {
+        cleanup_start_resources();
+        return ESP_ERR_NO_MEM;
+    }
     if (!config.dataEnabled) set_status_cell_ip("");
     load_identity_cache();
 
@@ -1709,6 +1775,7 @@ esp_err_t idf_modem_start(const IdfConfig& config)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "UART driver install failed: %s", esp_err_to_name(err));
         idf_logf("模组 UART 驱动安装失败: %s", esp_err_to_name(err));
+        cleanup_start_resources();
         return err;
     }
     err = uart_param_config(MODEM_UART, &uart_cfg);
@@ -1717,6 +1784,7 @@ esp_err_t idf_modem_start(const IdfConfig& config)
         idf_logf("模组 UART 参数配置失败: %s", esp_err_to_name(err));
         uart_driver_delete(MODEM_UART);
         s_uart_evt_queue = nullptr;
+        cleanup_start_resources();
         return err;
     }
     err = uart_set_pin(MODEM_UART, MODEM_TXD, MODEM_RXD, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
@@ -1725,16 +1793,18 @@ esp_err_t idf_modem_start(const IdfConfig& config)
         idf_logf("模组 UART 引脚配置失败: %s", esp_err_to_name(err));
         uart_driver_delete(MODEM_UART);
         s_uart_evt_queue = nullptr;
+        cleanup_start_resources();
         return err;
     }
     uart_flush_input(MODEM_UART);
     s_started = true;
 
-    BaseType_t ok = xTaskCreate(modem_task, "idf_modem", 6144, nullptr, 4, nullptr);
+    BaseType_t ok = xTaskCreate(modem_task, "idf_modem", 8192, nullptr, 4, nullptr);
     if (ok != pdPASS) {
         s_started = false;
         uart_driver_delete(MODEM_UART);
         s_uart_evt_queue = nullptr;
+        cleanup_start_resources();
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;

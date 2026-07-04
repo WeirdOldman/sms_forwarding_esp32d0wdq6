@@ -18,6 +18,7 @@
 #include "esp_netif.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "esp_wifi_default.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
@@ -56,6 +57,7 @@ static esp_timer_handle_t s_reconnect_timer = nullptr;
 static char s_ntp_server[128] = "ntp.aliyun.com";
 
 static esp_err_t start_provisioning_ap(bool manual = false);
+static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event_id, void* event_data);
 
 struct ApState {
     bool mode = false;
@@ -104,11 +106,54 @@ static std::string format_epoch_local(time_t epoch, int tz_offset_min)
     return std::string(buf);
 }
 
+static std::atomic<bool> s_ntp_first_logged{false};
+static std::atomic<int64_t> s_ntp_manual_us{-1};
+
+static void cleanup_wifi_start_resources(bool wifi_inited,
+                                         bool wifi_event_registered,
+                                         bool ip_event_registered)
+{
+    if (ip_event_registered) {
+        esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler);
+    }
+    if (wifi_event_registered) {
+        esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler);
+    }
+    if (wifi_inited) esp_wifi_deinit();
+    if (s_sta_netif) {
+        esp_netif_destroy_default_wifi(s_sta_netif);
+        s_sta_netif = nullptr;
+    }
+    if (s_ap_netif) {
+        esp_netif_destroy_default_wifi(s_ap_netif);
+        s_ap_netif = nullptr;
+    }
+    if (s_wifi_event_group) {
+        vEventGroupDelete(s_wifi_event_group);
+        s_wifi_event_group = nullptr;
+    }
+    if (s_state_mutex) {
+        vSemaphoreDelete(s_state_mutex);
+        s_state_mutex = nullptr;
+    }
+    s_has_sta_credentials.store(false, std::memory_order_relaxed);
+    s_sta_configured.store(false, std::memory_order_relaxed);
+    s_sta_connected.store(false, std::memory_order_relaxed);
+}
+
 static void sntp_sync_cb(timeval*)
 {
+    // 只在首次同步成功或手动校时后打日志：周期同步静默，避免刷屏。
+    // 窗口放宽到 10 分钟(弱网下 SNTP 重试可能很慢)，命中一次即清除标记
+    bool first = !s_ntp_first_logged.exchange(true, std::memory_order_relaxed);
+    int64_t manual_us = s_ntp_manual_us.load(std::memory_order_relaxed);
+    bool manual = manual_us >= 0 && (esp_timer_get_time() - manual_us) < 600000000LL;
+    if (manual) s_ntp_manual_us.store(-1, std::memory_order_relaxed);
+    if (!first && !manual) return;
+
     time_t now = time(nullptr);
-    IdfConfig cfg = idf_config_get();
-    std::string local = format_epoch_local(now, cfg.tzOffsetMin);
+    // 本回调在 tiT(lwip) 小栈上执行：只取时区，绝不深拷贝整个 IdfConfig(会爆栈)
+    std::string local = format_epoch_local(now, idf_config_get_tz_offset());
     if (local.empty()) {
         idf_logf("NTP 时间同步成功，epoch=%ld", static_cast<long>(now));
     } else {
@@ -121,8 +166,9 @@ static void start_sntp_once()
     bool expected = false;
     if (!s_sntp_started.compare_exchange_strong(expected, true, std::memory_order_relaxed)) return;
 
-    IdfConfig cfg = idf_config_get();
-    std::string server = cfg.ntpServer.empty() ? "ntp.aliyun.com" : cfg.ntpServer;
+    // 在系统事件任务(栈 4KB)上执行：只取 NTP 服务器名，避免深拷贝整个 IdfConfig
+    std::string server = idf_config_get_ntp_server();
+    if (server.empty()) server = "ntp.aliyun.com";
     strlcpy(s_ntp_server, server.c_str(), sizeof(s_ntp_server));
 
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
@@ -132,6 +178,8 @@ static void start_sntp_once()
     // (需要 CONFIG_LWIP_SNTP_MAX_SERVERS>=3，见 sdkconfig.defaults)
     esp_sntp_setservername(1, "ntp.ntsc.ac.cn");
     esp_sntp_setservername(2, "pool.ntp.org");
+    // ESP32-C3 晶振日漂移在秒级，调度粒度是"天"——每 24h 校一次足够，默认 1h 太频繁
+    esp_sntp_set_sync_interval(24 * 3600 * 1000);
     esp_sntp_init();
     idf_logf("NTP 时间同步已启动：首选=%s，备用=ntp.ntsc.ac.cn,pool.ntp.org", s_ntp_server);
 }
@@ -163,6 +211,11 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
         // 前几次断开立即重连(快速恢复瞬断)；持续失败后退避，交给 15s 看门狗定时器，
         // 避免错误密码/信号差时无间隔连接风暴打断配网 AP 和 WiFi 扫描
         int streak = s_disconnect_streak.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (streak == 1 && event_data) {
+            // 只在断开链的第一次记 Web 日志：原因码用于区分路由器踢/信号差/漫游
+            auto* ev = static_cast<wifi_event_sta_disconnected_t*>(event_data);
+            idf_logf("WiFi 断开(原因码 %d)，自动重连", static_cast<int>(ev->reason));
+        }
         if (streak <= 3 && sta_can_connect()) {
             esp_wifi_connect();
             ESP_LOGW(TAG, "STA 断开，立即重连(第%d次)", streak);
@@ -209,6 +262,7 @@ static void dns_captive_task(void*)
 {
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (sock < 0) {
+        s_dns_task_started.store(false, std::memory_order_relaxed);
         idf_log_line("配网 DNS 创建失败");
         vTaskDelete(nullptr);
         return;
@@ -225,6 +279,7 @@ static void dns_captive_task(void*)
     if (bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
         idf_log_line("配网 DNS 绑定 53 端口失败");
         close(sock);
+        s_dns_task_started.store(false, std::memory_order_relaxed);
         vTaskDelete(nullptr);
         return;
     }
@@ -273,6 +328,17 @@ static void dns_captive_task(void*)
     vTaskDelete(nullptr);
 }
 
+static void start_dns_task_once()
+{
+    bool expected = false;
+    if (!s_dns_task_started.compare_exchange_strong(expected, true, std::memory_order_relaxed)) return;
+    BaseType_t ok = xTaskCreate(dns_captive_task, "idf_dns", 3072, nullptr, 2, nullptr);
+    if (ok != pdPASS) {
+        s_dns_task_started.store(false, std::memory_order_relaxed);
+        idf_log_line("配网 DNS 任务启动失败");
+    }
+}
+
 static bool mdns_query_matches_sms_local(const uint8_t* packet, int len, int offset)
 {
     static constexpr char kName[] = "\x03sms\x05local";
@@ -305,6 +371,7 @@ static void mdns_sms_task(void*)
 {
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (sock < 0) {
+        s_mdns_task_started.store(false, std::memory_order_relaxed);
         idf_log_line("mDNS socket 创建失败");
         vTaskDelete(nullptr);
         return;
@@ -323,6 +390,7 @@ static void mdns_sms_task(void*)
     if (bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
         idf_log_line("mDNS 绑定 5353 端口失败");
         close(sock);
+        s_mdns_task_started.store(false, std::memory_order_relaxed);
         vTaskDelete(nullptr);
         return;
     }
@@ -390,6 +458,17 @@ static void mdns_sms_task(void*)
     }
 }
 
+static void start_mdns_task_once()
+{
+    bool expected = false;
+    if (!s_mdns_task_started.compare_exchange_strong(expected, true, std::memory_order_relaxed)) return;
+    BaseType_t ok = xTaskCreate(mdns_sms_task, "idf_mdns", 3072, nullptr, 2, nullptr);
+    if (ok != pdPASS) {
+        s_mdns_task_started.store(false, std::memory_order_relaxed);
+        idf_log_line("mDNS responder 启动失败");
+    }
+}
+
 static esp_err_t configure_ap_netif(void)
 {
     esp_netif_ip_info_t ip_info = {};
@@ -417,6 +496,7 @@ static esp_err_t start_provisioning_ap(bool manual)
             set_ap_state(true, true, ap.ssid);
             idf_log_line("BOOT长按触发：保留当前配网热点，已切为手动配网模式");
         }
+        start_dns_task_once();
         idf_logf("配网热点已开启，请访问 http://192.168.1.1/");
         return ESP_OK;
     }
@@ -455,11 +535,7 @@ static esp_err_t start_provisioning_ap(bool manual)
     }
     if (sta_can_connect()) ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
     set_ap_state(true, manual, ssid);
-    if (!s_dns_task_started.load(std::memory_order_relaxed)) {
-        BaseType_t ok = xTaskCreate(dns_captive_task, "idf_dns", 3072, nullptr, 2, nullptr);
-        if (ok == pdPASS) s_dns_task_started.store(true, std::memory_order_relaxed);
-        else idf_log_line("配网 DNS 任务启动失败");
-    }
+    start_dns_task_once();
     ESP_LOGW(TAG, "%s: %s, http://192.168.1.1/",
              manual ? "BOOT长按触发，已开启配网热点" : "已开启配网热点", ssid);
     idf_logf("%s: %s, http://192.168.1.1/",
@@ -548,61 +624,80 @@ esp_err_t idf_wifi_start(const IdfConfig& config)
     if (!s_state_mutex) return ESP_ERR_NO_MEM;
 
     s_wifi_event_group = xEventGroupCreate();
-    if (!s_wifi_event_group) return ESP_ERR_NO_MEM;
+    if (!s_wifi_event_group) {
+        cleanup_wifi_start_resources(false, false, false);
+        return ESP_ERR_NO_MEM;
+    }
     s_has_sta_credentials.store(!config.wifiSsid.empty(), std::memory_order_relaxed);
 
     s_sta_netif = esp_netif_create_default_wifi_sta();
     s_ap_netif = esp_netif_create_default_wifi_ap();
-    if (!s_sta_netif || !s_ap_netif) return ESP_ERR_NO_MEM;
+    if (!s_sta_netif || !s_ap_netif) {
+        cleanup_wifi_start_resources(false, false, false);
+        return ESP_ERR_NO_MEM;
+    }
 
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    bool wifi_inited = false;
+    bool wifi_event_registered = false;
+    bool ip_event_registered = false;
     esp_err_t err = esp_wifi_init(&init_cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_init failed: %s", esp_err_to_name(err));
         idf_logf("WiFi 初始化失败: %s", esp_err_to_name(err));
+        cleanup_wifi_start_resources(false, false, false);
         return err;
     }
+    wifi_inited = true;
     err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_set_storage failed: %s", esp_err_to_name(err));
         idf_logf("WiFi 存储模式配置失败: %s", esp_err_to_name(err));
+        cleanup_wifi_start_resources(wifi_inited, wifi_event_registered, ip_event_registered);
         return err;
     }
     err = esp_wifi_set_ps(WIFI_PS_NONE);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_set_ps failed: %s", esp_err_to_name(err));
         idf_logf("WiFi 省电模式配置失败: %s", esp_err_to_name(err));
+        cleanup_wifi_start_resources(wifi_inited, wifi_event_registered, ip_event_registered);
         return err;
     }
     err = esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, nullptr);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "WIFI_EVENT handler register failed: %s", esp_err_to_name(err));
         idf_logf("WiFi 事件处理器注册失败: %s", esp_err_to_name(err));
+        cleanup_wifi_start_resources(wifi_inited, false, false);
         return err;
     }
+    wifi_event_registered = true;
     err = esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, nullptr);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "IP_EVENT handler register failed: %s", esp_err_to_name(err));
         idf_logf("IP 事件处理器注册失败: %s", esp_err_to_name(err));
+        cleanup_wifi_start_resources(wifi_inited, wifi_event_registered, false);
         return err;
     }
+    ip_event_registered = true;
     err = esp_wifi_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(err));
         idf_logf("WiFi 启动失败: %s", esp_err_to_name(err));
+        cleanup_wifi_start_resources(wifi_inited, wifi_event_registered, ip_event_registered);
         return err;
     }
     s_started.store(true, std::memory_order_relaxed);
-    if (!s_mdns_task_started.load(std::memory_order_relaxed)) {
-        BaseType_t ok = xTaskCreate(mdns_sms_task, "idf_mdns", 3072, nullptr, 2, nullptr);
-        if (ok == pdPASS) s_mdns_task_started.store(true, std::memory_order_relaxed);
-        else idf_log_line("mDNS responder 启动失败");
-    }
-    if (!s_button_task_started.load(std::memory_order_relaxed)) {
-        // 3072：任务里 start_provisioning_ap 会用到 wifi_config_t(~132B) + 日志格式化缓冲
-        BaseType_t ok = xTaskCreate(provision_button_task, "idf_boot_ap", 3072, nullptr, 2, nullptr);
-        if (ok == pdPASS) s_button_task_started.store(true, std::memory_order_relaxed);
-        else idf_log_line("BOOT 配网按键任务启动失败");
+    start_mdns_task_once();
+    // 3072：任务里 start_provisioning_ap 会用到 wifi_config_t(~132B) + 日志格式化缓冲
+    {
+        bool expected = false;
+        if (s_button_task_started.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+            BaseType_t ok = xTaskCreate(provision_button_task, "idf_boot_ap", 3072, nullptr, 2, nullptr);
+            if (ok != pdPASS) {
+                s_button_task_started.store(false, std::memory_order_relaxed);
+                idf_log_line("BOOT 配网按键任务启动失败");
+            }
+        }
     }
 
     if (!s_reconnect_timer) {
@@ -645,6 +740,7 @@ esp_err_t idf_wifi_resync_ntp(void)
 {
     if (!s_started.load(std::memory_order_relaxed)) return ESP_ERR_INVALID_STATE;
     if (!s_sta_connected.load(std::memory_order_relaxed)) return ESP_ERR_INVALID_STATE;  // 未联网无法校时
+    s_ntp_manual_us.store(esp_timer_get_time(), std::memory_order_relaxed);  // 手动校时的结果要打日志
     if (!s_sntp_started.load(std::memory_order_relaxed)) {
         start_sntp_once();  // 尚未启动则启动(内部会立即发起一次请求)
         idf_logf("网页触发 NTP 校时：SNTP 已启动");

@@ -42,11 +42,16 @@ struct IdfCellularHttpResult {
     std::string message;
 };
 
+struct IdfCellularHttpConfig {
+    bool dataEnabled = false;
+    std::string apn;
+};
+
 esp_err_t idf_modem_start(const IdfConfig& config);
 esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response);
 esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uint32_t timeout_ms, std::string& response);
 esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint32_t timeout_ms, std::string& response);
-esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfConfig& config, IdfCellularHttpResult& result);
+esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularHttpConfig& config, IdfCellularHttpResult& result);
 esp_err_t idf_modem_request_reset(bool hard_reset);
 bool idf_modem_take_urc(std::string& out);
 // 等待模组事件(新 URC 入缓冲/外部唤醒)，超时返回 false；用于替代固定轮询延时

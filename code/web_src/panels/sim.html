@@ -1,7 +1,8 @@
 <div class="panel" id="panel-sim">
       <h1 class="page-title">网络设置</h1>
       <p class="page-subtitle">WiFi 接入、蜂窝数据与 SIM 注册设置。本机经 WiFi 转发，默认不开启蜂窝流量</p>
-      <div class="card-grid">
+      <div class="card-grid sim-grid">
+        <div class="sim-stack">
         <form action="/save" method="POST" id="simFormEl">
         <input type="hidden" name="simForm" value="1">
         <div class="card">
@@ -27,6 +28,25 @@
         <button type="submit" class="btn btn-primary btn-block btn-save">保存蜂窝设置</button>
         </form>
         <div class="card">
+          <div class="card-header">eSIM 本地管理<span class="schedule-tag" id="esimCount">--</span></div>
+          <div class="card-body">
+            <div class="esim-status-line">
+              <div><span class="dk">EID</span><div class="dv" id="esimEid">未读取</div></div>
+              <div><span class="dk">最后刷新</span><div class="dv" id="esimUpdated">--</div></div>
+            </div>
+            <div class="esim-actions"><button class="btn btn-primary" type="button" onclick="esimInfo()">查询 eSIM 信息</button><button class="btn btn-secondary" type="button" onclick="esimRefresh()">刷新配置列表</button></div>
+            <div class="esim-table-wrap">
+              <table class="esim-table">
+                <thead><tr><th>ICCID</th><th>昵称</th><th>状态</th><th>操作</th></tr></thead>
+                <tbody id="esimProfiles"><tr><td colspan="4" class="msg-empty">尚未读取 eSIM Profile</td></tr></tbody>
+              </table>
+            </div>
+            <div class="result-box" id="esimResult"></div>
+          </div>
+        </div>
+        </div>
+        <div class="sim-stack">
+        <div class="card">
           <div class="card-header">WiFi 网络<button class="btn btn-secondary btn-sm" style="margin-left:auto;" onclick="wifiScan()">扫描</button></div>
           <div class="card-body">
             <div class="form-group"><label class="form-label">选择网络</label><select class="form-select" id="wifiScanSel" onchange="wifiPick()"><option value="">点“扫描”获取周边 WiFi</option></select></div>
@@ -37,6 +57,7 @@
             <div class="result-box" id="wifiCfgResult"></div>
             <div class="result-box" id="wifiResult"></div>
           </div>
+        </div>
         </div>
       </div>
     </div>

@@ -8,6 +8,7 @@ idf_component_register(
     heap
     esp_http_server
     idf_config
+    idf_esim
     idf_inbox
     idf_logbuf
     idf_modem

@@ -238,8 +238,19 @@ static void init_persistence()
         ESP_LOGW(TAG, "smsdata 分区初始化失败(%s)，短信留存降级为纯内存", esp_err_to_name(err));
         return;
     }
-    if (nvs_open_from_partition(SMS_NVS_PART, NS_INBOX, NVS_READWRITE, &s_inbox_nvs) != ESP_OK ||
-        nvs_open_from_partition(SMS_NVS_PART, NS_SENT, NVS_READWRITE, &s_sent_nvs) != ESP_OK) {
+    esp_err_t inbox_err = nvs_open_from_partition(SMS_NVS_PART, NS_INBOX, NVS_READWRITE, &s_inbox_nvs);
+    esp_err_t sent_err = inbox_err == ESP_OK
+        ? nvs_open_from_partition(SMS_NVS_PART, NS_SENT, NVS_READWRITE, &s_sent_nvs)
+        : inbox_err;
+    if (inbox_err != ESP_OK || sent_err != ESP_OK) {
+        if (inbox_err == ESP_OK) {
+            nvs_close(s_inbox_nvs);
+            s_inbox_nvs = 0;
+        }
+        if (sent_err == ESP_OK) {
+            nvs_close(s_sent_nvs);
+            s_sent_nvs = 0;
+        }
         ESP_LOGW(TAG, "smsdata 命名空间打开失败，短信留存降级为纯内存");
         return;
     }
@@ -302,7 +313,8 @@ void idf_inbox_init(void)
 uint32_t idf_inbox_add(const char* sender, const char* text, const char* ts)
 {
     ensure_init();
-    if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return 0;
+    // 收到短信后入库不能因为网页正在读/flash 正在提交而放弃；SMS 任务本来就是串行处理。
+    if (!s_mutex || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return 0;
 
     InboxSlot& e = s_inbox[s_inbox_head];
     // 环满时该物理槽即将覆盖最旧短信：先把它的 flash key 擦掉，保持 NVS 只存活动条目
@@ -328,7 +340,7 @@ void idf_inbox_mark_forwarded(uint32_t id)
 {
     if (id == 0) return;
     ensure_init();
-    if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return;
+    if (!s_mutex || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return;
     for (size_t i = 0; i < s_inbox_filled; ++i) {
         if (s_inbox[i].id == id && !s_inbox[i].deleted) {
             s_inbox[i].forwarded = true;
@@ -422,7 +434,7 @@ bool idf_inbox_delete(uint32_t id)
 void idf_sent_add(const char* target, const char* text, bool ok)
 {
     ensure_init();
-    if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return;
+    if (!s_mutex || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return;
 
     IdfSentEntry& e = s_sent[s_sent_head];
     uint32_t evict_id = (s_sent_filled == SENT_MAX && e.id != 0) ? e.id : 0;

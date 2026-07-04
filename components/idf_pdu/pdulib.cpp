@@ -42,13 +42,27 @@
 #include <string.h>
 #endif
 #include <ctype.h>
+#include <new>
 #include <pdulib.h>
 
 PDU::PDU(int worksize ) {
+  if (worksize < 16)
+    worksize = 16;
   generalWorkBuffLength = worksize;
-  generalWorkBuff = new char[generalWorkBuffLength+2]; // dynamically allocate buffer
+  generalWorkBuff = new (std::nothrow) char[generalWorkBuffLength+2]; // dynamically allocate buffer
+  if (generalWorkBuff)
+    *generalWorkBuff = 0;
+  scabuffin[0] = 0;
+  scabuffout[0] = 0;
+  addressBuff[0] = 0;
+  tsbuff[0] = 0;
+  memset(concatInfo, 0, sizeof(concatInfo));
+  overFlow = false;
 }
-PDU::~PDU() {}
+PDU::~PDU() {
+  delete[] generalWorkBuff;
+  generalWorkBuff = nullptr;
+}
 
 // array must be defined before its use in sizeof statement
 const
@@ -94,7 +108,7 @@ bool PDU::setAddress(const char *address, /*eAddressType at,*/ eLengthType lt, c
       at = INTERNATIONAL_NUMERIC;
     }
     addressLength = strlen(address);
-    if (addressLength < MAX_NUMBER_LENGTH)
+    if (addressLength <= MAX_NUMBER_LENGTH)
     {
       if (lt == NIBBLES)  // recipient
         buffer[smsOffset++] = addressLength;
@@ -196,6 +210,8 @@ int PDU::convert_utf8_to_gsm7bit(const char *message, char *gsm7bit, int udhsize
   {
     // sanity check against overflow
     int length = utf8Length(message);
+    if (length <= 0)
+      return GSM7_TOO_LONG;
     unsigned short ucs2[2], target; // allow for surrogate pair
     utf8_to_ucs2_single(message, ucs2);
     target = (ucs2[0] << 8) | ((ucs2[0] & 0xff00) >> 8); // swap endian
@@ -319,6 +335,10 @@ int PDU::buildUDH(unsigned short csms, unsigned numparts, unsigned partnumber)
 */
 int PDU::encodePDU(const char *recipient, const char *message, unsigned short csms, unsigned char numparts, unsigned char partnumber)
 {
+  if (!generalWorkBuff)
+    return WORK_BUFFER_TOO_SMALL;
+  if (!recipient || !message)
+    return ADDRESS_FORMAT;
   int length = -1;
   int delta = -1;
   char tempbuf[PDU_BINARY_MAX_LENGTH];
@@ -346,6 +366,8 @@ int PDU::encodePDU(const char *recipient, const char *message, unsigned short cs
   {
     unsigned short ucs2[2], target; // allow for surrogate pair
     int length = utf8Length(message);
+    if (length <= 0)
+      return UCS2_TOO_LONG;
     utf8_to_ucs2_single(message, ucs2); // translate to a single ucs2
     // ucs2 is bigendian, swap to little endian
     target = (ucs2[0] << 8) | ((ucs2[0] & 0xff00) >> 8);
@@ -522,7 +544,7 @@ int PDU::convert_7bit_to_unicode(unsigned char *gsm7bit, int length, char *unico
   for (r = 0; r < length; r++)
   {
     // check for buffer overflow
-    if (w >= generalWorkBuffLength) {
+    if (w + 4 >= generalWorkBuffLength) {
       overFlow = true;
       unicode[w] = 0;  // add end marker
       return w;
@@ -558,6 +580,11 @@ int PDU::convert_7bit_to_unicode(unsigned char *gsm7bit, int length, char *unico
     {
       /* If we're escaped then the next uint8_t have a special meaning. */
       r++;
+      if (r >= length)
+      {
+        unicode[w++] = NPC8;
+        break;
+      }
       switch (gsm7bit[r])
       {
       case 10:
@@ -606,6 +633,17 @@ int PDU::convert_7bit_to_unicode(unsigned char *gsm7bit, int length, char *unico
 
 int PDU::pduGsm7_to_unicode(const char *pdu, int numSeptets, char *unicode, char firstchar)
 {
+  if (numSeptets <= 0)
+  {
+    *unicode = 0;
+    return 0;
+  }
+  if (numSeptets > MAX_SMS_LENGTH_7BIT)
+  {
+    overFlow = true;
+    *unicode = 0;
+    return 0;
+  }
   int r;
   int w;
   int length;
@@ -654,6 +692,8 @@ int PDU::pduGsm7_to_unicode(const char *pdu, int numSeptets, char *unicode, char
 */
 bool PDU::decodePDU(const char *pdu)
 {
+  if (!pdu || !generalWorkBuff)
+    return false;
   bool rc = true;
   int index = 0;
   int outindex = 0;
@@ -662,82 +702,159 @@ bool PDU::decodePDU(const char *pdu)
   char udhfollower = 0;
 
   unsigned char X;
+  const size_t pduHexLen = strlen(pdu);
+  auto canRead = [&](int pos, size_t hexChars) -> bool {
+    if (pos < 0) return false;
+    size_t p = static_cast<size_t>(pos);
+    return p <= pduHexLen && hexChars <= (pduHexLen - p);
+  };
+  auto readHex = [&](int pos, unsigned char& out) -> bool {
+    if (!canRead(pos, 2)) return false;
+    out = gethex(&pdu[pos]);
+    return true;
+  };
   overFlow = false;
   // 每次解码前清空分段信息：带非 concat UDH 的短信(WAP push/端口寻址等)不会走
   // concat 分支，若不清空会残留上一条的 ref/part/total，把无关短信误并入长短信槽位
   memset(concatInfo, 0, sizeof(concatInfo));
-  i = decodeAddress(pdu, scabuffin, OCTETS);
-  if (i < 0) // issue 47
-  {
+  if (!readHex(0, X))
     return false;
+  int scaOctets = X;
+  if (!canRead(2, static_cast<size_t>(scaOctets) * 2))
+    return false;
+  if (scaOctets == 0)
+  {
+    *scabuffin = 0;
+    index = 2;
   }
-  index = i + 4; // skip over SCA length and atn
-  tpdu = gethex(&pdu[index]);
+  else
+  {
+    i = decodeAddress(pdu, scabuffin, OCTETS);
+    if (i < 0) // issue 47
+    {
+      return false;
+    }
+    index = 2 + scaOctets * 2; // skip over SCA length and content
+  }
+  if (!readHex(index, X))
+    return false;
+  tpdu = X;
   index += 2; // skip over tpdu
   udhPresent = tpdu & (1 << PDU_UDHI);
+  if (!readHex(index, X))
+    return false;
+  size_t addressHexChars = 4 + ((static_cast<size_t>(X) + 1) / 2) * 2;
+  if (!canRead(index, addressHexChars))
+    return false;
   i = decodeAddress(&pdu[index], addressBuff, NIBBLES);
   if (i < 0)  // error 47
     return false;
-  index += i + 4; // skip over sender number length & atn
+  index += static_cast<int>(addressHexChars); // skip over sender number length & atn
   // pid = gethex(&pdu[index]); // TP-PID
+  if (!canRead(index, 2 + 2 + 14 + 2))
+    return false;
   index += 2;                // skip over PID
-  dcs = gethex(&pdu[index]); // data coding system
+  if (!readHex(index, X))
+    return false;
+  dcs = X; // data coding system
   index += 2;
   // decode SCTS timestamp
   outindex = 0;
   for (i = 0; i < 7; i++)
   {
-    X = gethex(&pdu[index]);
+    if (!readHex(index, X))
+      return false;
     index += 2;
     tsbuff[outindex++] = (X & 0xf) + 0x30;
     tsbuff[outindex++] = (X >> 4) + 0x30;
   }
   tsbuff[outindex] = 0;
   // decode the actual data
-  int dulength = gethex(&pdu[index]);
+  if (!readHex(index, X))
+    return false;
+  int dulength = X;
   index += 2;
+  size_t userDataOctets = 0;
+  switch (dcs & DCS_ALPHABET_MASK)
+  {
+  case DCS_7BIT_ALPHABET_MASK:
+    if (dulength > MAX_SMS_LENGTH_7BIT) return false;
+    userDataOctets = (static_cast<size_t>(dulength) * 7 + 7) / 8;
+    break;
+  case DCS_8BIT_ALPHABET_MASK:
+  case DCS_16BIT_ALPHABET_MASK:
+    if (dulength > MAX_NUMBER_OCTETS) return false;
+    userDataOctets = static_cast<size_t>(dulength);
+    break;
+  default:
+    return false;
+  }
+  if (!canRead(index, userDataOctets * 2))
+    return false;
+  const int userDataEnd = index + static_cast<int>(userDataOctets * 2);
   int utflength = 0, utfoffset;
   unsigned short ucs2;
   *generalWorkBuff = 0;
   if (udhPresent)
   {
-    int udhlength = gethex(&pdu[index]);
+    if (!readHex(index, X))
+      return false;
+    int udhlength = X;
     index += 2;
+    if (static_cast<size_t>(udhlength) + 1 > userDataOctets)
+      return false;
     switch (udhlength)
     {
     default:
-      index += (udhlength + 1);
-      dulength -= udhlength;
+      index += udhlength * 2;
+      if ((dcs & DCS_ALPHABET_MASK) == DCS_7BIT_ALPHABET_MASK)
+        dulength -= ((udhlength + 1) * 8 + 6) / 7;
+      else
+        dulength -= (udhlength + 1);
       break; // skip over it
       // return false;
     case 5:
     case 6:
-      int iei = gethex(&pdu[index]);
+      if (!readHex(index, X))
+        return false;
+      int iei = X;
       index += 2;
-      int ieilength = gethex(&pdu[index]);
+      if (!readHex(index, X))
+        return false;
+      int ieilength = X;
       index += 2;
       if ((udhlength == 5 && iei == 0 && ieilength == 3) || (udhlength == 6 && iei == 8 && ieilength == 4))
       {
-        concatInfo[0] = gethex(&pdu[index]);
+        if (!readHex(index, X))
+          return false;
+        concatInfo[0] = X;
         index += 2; // skip 8 bits of CSMS ref
         if (udhlength == 6)
         { // get lo byte of ref number, have already goy hi byte
-          unsigned char lo = gethex(&pdu[index]);
+          unsigned char lo = 0;
+          if (!readHex(index, lo))
+            return false;
           concatInfo[0] <<= 8;
           concatInfo[0] += lo;
           index += 2;
         }
-        concatInfo[2] = gethex(&pdu[index]); // get total number of parts
+        if (!readHex(index, X))
+          return false;
+        concatInfo[2] = X; // get total number of parts
         index += 2;
-        concatInfo[1] = gethex(&pdu[index]); // get part number
+        if (!readHex(index, X))
+          return false;
+        concatInfo[1] = X; // get part number
         index += 2;
         if ((dcs & DCS_ALPHABET_MASK) == DCS_7BIT_ALPHABET_MASK)
         {
-          dulength -= 7; // dulength is in septets, last septet is first char of message
+          dulength -= (udhlength == 6) ? 8 : 7; // 7-bit UDH 占用的 septet 数
           if (udhlength == 5) {
             // retrieve first char from byte following UDH
             // bug fix Issues 28 & 30
-            udhfollower = gethex(&pdu[index]) >> 1;
+            if (!readHex(index, X))
+              return false;
+            udhfollower = X >> 1;
             index += 2; // skip to next 7 octet (14 nibble) boundary
           }
         }
@@ -748,6 +865,8 @@ bool PDU::decodePDU(const char *pdu)
         return false;
       break;
     }
+    if (dulength < 0 || index > userDataEnd)
+      return false;
   }
   else
   {
@@ -757,6 +876,14 @@ bool PDU::decodePDU(const char *pdu)
   {
   case DCS_7BIT_ALPHABET_MASK:
     outindex = 0;
+    if (dulength < 0)
+      return false;
+    {
+      int septetsFromPdu = dulength;
+      if (udhfollower != 0 && septetsFromPdu > 0) --septetsFromPdu;
+      if (!canRead(index, ((static_cast<size_t>(septetsFromPdu) * 7 + 7) / 8) * 2))
+        return false;
+    }
     i = pduGsm7_to_unicode(&pdu[index], dulength, (char *)generalWorkBuff,udhfollower);
     generalWorkBuff[i] = 0;
   //  utf8length = i;
@@ -766,19 +893,25 @@ bool PDU::decodePDU(const char *pdu)
     rc = false;
     break;
   case DCS_16BIT_ALPHABET_MASK:
+    if ((dulength & 1) != 0)
+      return false;
     // loop on all ucs2 words until done
     utfoffset = 0;
     while (dulength)
     {
+      if (!canRead(index, 4))
+        return false;
       pdu_to_ucs2(&pdu[index], 2, &ucs2); // treat 2 octets
       index += 4;
       dulength -= 2;
-      utflength = ucs2_to_utf8(ucs2, generalWorkBuff + utfoffset);
+      char utf8tmp[5] = {};
+      utflength = ucs2_to_utf8(ucs2, utf8tmp);
       // check for overflow
       if ((utfoffset + utflength) >= generalWorkBuffLength) {
         overFlow = true;
         break;
       }
+      memcpy(generalWorkBuff + utfoffset, utf8tmp, utflength);
       utfoffset += utflength;
     }
   //  utf8length = utfoffset;
@@ -986,7 +1119,7 @@ const char *PDU::getTimeStamp()
 }
 const char *PDU::getText()
 {
-  return generalWorkBuff;
+  return generalWorkBuff ? generalWorkBuff : "";
 }
 
 void PDU::BCDtoString(char *output, const char *input, int length)
@@ -1014,10 +1147,27 @@ int PDU::decodeAddress(const char *pdu, char *output, eLengthType et)
   // if octets, length include TON so reduce by 1
   // if nibbles length is just the number
   if (et == NIBBLES)
+  {
     addressLength = length;
+    if (addressLength > MAX_NUMBER_LENGTH) {
+      *output = 0;
+      addressLength = 0;
+      return -1;
+    }
+  }
   else {
     // Issue 47 only relevant to SCA
+    if (length == 0) {
+      addressLength = 0;
+      *output = 0;
+      return 0;
+    }
     addressLength = --length * 2;
+    if (addressLength > MAX_NUMBER_LENGTH) {
+      *output = 0;
+      addressLength = 0;
+      return -1;
+    }
     if (addressLength == 0) {
       *output = 0;
       return 0;    
@@ -1045,7 +1195,12 @@ int PDU::decodeAddress(const char *pdu, char *output, eLengthType et)
         addressLength++;            // we could do this before calling BCDtoString
       break;
     case 5: // alphabetic, convert  nibble length to septets
-      pduGsm7_to_unicode(pdu, (addressLength * 4) / 7, output,0);
+      {
+        char decoded[PDU_ADDRESS_TEXT_BUFFER] = {};
+        pduGsm7_to_unicode(pdu, (addressLength * 4) / 7, decoded,0);
+        strncpy(output, decoded, PDU_ADDRESS_TEXT_BUFFER - 1);
+        output[PDU_ADDRESS_TEXT_BUFFER - 1] = 0;
+      }
       if ((addressLength & 1) == 1) // if odd, bump 1
         addressLength++;            // we could do NOT this before calling pduGsm7_to_unicode
       break;
@@ -1071,6 +1226,8 @@ int PDU::utf8_to_ucs2(const char *utf8, char *ucs2)
   while (*utf8 && octets <= MAX_NUMBER_OCTETS)
   {
     int inputlen = utf8Length(utf8);
+    if (inputlen <= 0)
+      return UCS2_TOO_LONG;
     //    int ucslength = utf8_to_ucs2_single(utf8,(short *)ucs2);
     ucslength = utf8_to_ucs2_single(utf8, tempucs2);
     // sanity check against overflowing the buffer
@@ -1087,12 +1244,17 @@ int PDU::utf8_to_ucs2(const char *utf8, char *ucs2)
 
 const char *PDU::getSMS()
 {
-  return generalWorkBuff;
+  return generalWorkBuff ? generalWorkBuff : "";
 }
 
 void PDU::setSCAnumber(const char *n)
 {
-  strcpy(scabuffout, n);
+  if (!n) {
+    *scabuffout = 0;
+    return;
+  }
+  strncpy(scabuffout, n, sizeof(scabuffout) - 1);
+  scabuffout[sizeof(scabuffout) - 1] = 0;
 }
 
 void PDU::setSCAnumber()
@@ -1150,7 +1312,7 @@ int PDU::buildUtf(unsigned long cp, char *target)
         buf[0] |= (cp >> 12) & (1 << (k - 12));
     }
   }
-  else if (cp > 0x10000)
+  else if (cp <= 0x10ffff)
   { // emojis, drawings, chinese
     length = 4;
     buf[0] = BITS7654ON;
@@ -1170,7 +1332,13 @@ int PDU::buildUtf(unsigned long cp, char *target)
         buf[0] |= (cp >> 18) & (1 << (k - 18));
     }
   }
-  strcpy(target, (char *)buf);
+  else
+  {
+    length = 1;
+    buf[0] = NPC8;
+    buf[length] = 0;
+  }
+  memcpy(target, buf, length + 1);
   return strlen(target);
 }
 

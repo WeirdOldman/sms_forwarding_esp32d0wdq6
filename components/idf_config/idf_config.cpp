@@ -4,6 +4,7 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -22,14 +23,22 @@
 static const char* TAG = "idf_config";
 static IdfConfig s_config;
 static SemaphoreHandle_t s_config_mutex = nullptr;
+static SemaphoreHandle_t s_persist_mutex = nullptr;
 
 static esp_err_t save_config_to_nvs(const IdfConfig& c);
+static esp_err_t commit_config_update(IdfConfig& next, const IdfConfig& base);
 
 static esp_err_t ensure_config_mutex()
 {
-    if (s_config_mutex) return ESP_OK;
-    s_config_mutex = xSemaphoreCreateMutex();
-    return s_config_mutex ? ESP_OK : ESP_ERR_NO_MEM;
+    if (!s_config_mutex) {
+        s_config_mutex = xSemaphoreCreateMutex();
+        if (!s_config_mutex) return ESP_ERR_NO_MEM;
+    }
+    if (!s_persist_mutex) {
+        s_persist_mutex = xSemaphoreCreateMutex();
+        if (!s_persist_mutex) return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
 }
 
 static IdfConfig config_snapshot()
@@ -122,38 +131,72 @@ static esp_err_t write_str(nvs_handle_t nvs, const char* key, const std::string&
     return nvs_set_str(nvs, key, value.c_str());
 }
 
-static const std::string* find_field(const IdfFormFields& fields, const char* key)
-{
-    for (const auto& field : fields) {
-        if (field.first == key) return &field.second;
-    }
-    return nullptr;
-}
-
-static bool has_field(const IdfFormFields& fields, const char* key)
-{
-    return find_field(fields, key) != nullptr;
-}
-
-static int to_int(const std::string* value, int fallback)
-{
-    if (!value) return fallback;
-    char* end = nullptr;
-    long parsed = strtol(value->c_str(), &end, 10);
-    return end != value->c_str() ? static_cast<int>(parsed) : fallback;
-}
-
-static uint8_t to_u8(const std::string* value, uint8_t fallback)
-{
-    int parsed = to_int(value, fallback);
-    if (parsed < 0) return fallback;
-    if (parsed > 255) return fallback;
-    return static_cast<uint8_t>(parsed);
-}
-
 static int clamp_int(int value, int lo, int hi)
 {
     return value < lo ? lo : (value > hi ? hi : value);
+}
+
+static void limit_utf8_bytes(std::string& value, size_t max_len)
+{
+    if (value.size() <= max_len) return;
+    size_t end = max_len;
+    while (end > 0 && (static_cast<unsigned char>(value[end]) & 0xC0) == 0x80) --end;
+    value.resize(end);
+}
+
+static void normalize_config(IdfConfig& c)
+{
+    limit_utf8_bytes(c.wifiSsid, 64);
+    limit_utf8_bytes(c.wifiPass, 128);
+    limit_utf8_bytes(c.smtpServer, 128);
+    c.smtpPort = (c.smtpPort > 0 && c.smtpPort <= 65535) ? c.smtpPort : 465;
+    limit_utf8_bytes(c.smtpUser, 128);
+    limit_utf8_bytes(c.smtpPass, 256);
+    limit_utf8_bytes(c.smtpSendTo, 256);
+    limit_utf8_bytes(c.adminPhone, 64);
+    limit_utf8_bytes(c.webUser, 64);
+    limit_utf8_bytes(c.webPass, 128);
+    if (is_blank(c.webUser)) c.webUser = IDF_DEFAULT_WEB_USER;
+    if (is_blank(c.webPass)) c.webPass = IDF_DEFAULT_WEB_PASS;
+    limit_utf8_bytes(c.numberBlackList, 1024);
+    limit_utf8_bytes(c.forwardRules, 2048);
+
+    c.kaIntervalDays = clamp_int(c.kaIntervalDays, 1, 3650);
+    if (c.kaAction > 3) c.kaAction = 1;
+    limit_utf8_bytes(c.kaTarget, 64);
+    limit_utf8_bytes(c.kaUrl, 256);
+    if (c.kaUrl.empty()) c.kaUrl = IDF_KEEPALIVE_DEFAULT_URL;
+    limit_utf8_bytes(c.kaProfile, 64);
+
+    c.tzOffsetMin = clamp_int(c.tzOffsetMin, -720, 840);
+    limit_utf8_bytes(c.ntpServer, 128);
+    c.rebootHour = clamp_int(c.rebootHour, 0, 23);
+    c.hbHour = clamp_int(c.hbHour, 0, 23);
+
+    limit_utf8_bytes(c.apn, 96);
+    limit_utf8_bytes(c.operatorPlmn, 16);
+    limit_utf8_bytes(c.phoneNumber, 64);
+
+    for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
+        IdfPushChannel& ch = c.pushChannels[i];
+        ch.type = (ch.type >= 1 && ch.type <= 10) ? ch.type : 1;
+        limit_utf8_bytes(ch.name, 64);
+        if (ch.name.empty()) ch.name = channel_default_name(i);
+        limit_utf8_bytes(ch.url, 512);
+        limit_utf8_bytes(ch.key1, 256);
+        limit_utf8_bytes(ch.key2, 512);
+        limit_utf8_bytes(ch.customBody, 1024);
+    }
+
+    for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) {
+        IdfSchedTask& t = c.schedTasks[i];
+        limit_utf8_bytes(t.name, 32);
+        limit_utf8_bytes(t.profile, 64);
+        t.intervalDays = clamp_int(t.intervalDays, 1, 3650);
+        if (t.action > 3) t.action = 0;
+        limit_utf8_bytes(t.target, 128);
+        limit_utf8_bytes(t.payload, 128);
+    }
 }
 
 static std::string trim_copy(const std::string& value)
@@ -260,6 +303,7 @@ esp_err_t idf_config_load(void)
         next.kaAction = read_u8(nvs, "kaAct", 1);
         next.kaTarget = read_str(nvs, "kaTarget", "", 64);
         next.kaUrl = read_str(nvs, "kaUrl", IDF_KEEPALIVE_DEFAULT_URL, 256);
+        next.kaProfile = read_str(nvs, "kaProfile", "", 64);
         next.kaLastTime = read_u32(nvs, "kaLast", 0);
 
         next.tzOffsetMin = read_i32(nvs, "tzMin", 480);
@@ -269,6 +313,7 @@ esp_err_t idf_config_load(void)
         next.hbEnabled = read_bool(nvs, "hbEn", false);
         next.hbHour = read_i32(nvs, "hbHour", 9);
 
+        next.netLedEnabled = read_bool(nvs, "netLed", true);
         next.dataEnabled = read_bool(nvs, "dataEn", false);
         next.apn = read_str(nvs, "apn", "", 96);
         next.operatorPlmn = read_str(nvs, "opPlmn", "", 16);
@@ -292,6 +337,24 @@ esp_err_t idf_config_load(void)
             ch.customBody = read_str(nvs, key("body").c_str(), "", 1024);
         }
 
+        for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) {
+            auto key = [&](const char* suffix) {
+                char buf[16];
+                snprintf(buf, sizeof(buf), "st%d%s", i, suffix);
+                return std::string(buf);
+            };
+            IdfSchedTask& t = next.schedTasks[i];
+            t.enabled = read_bool(nvs, key("En").c_str(), false);
+            t.name = read_str(nvs, key("Name").c_str(), "", 32);
+            t.profile = read_str(nvs, key("Prof").c_str(), "", 64);
+            t.switchBack = read_bool(nvs, key("Back").c_str(), true);
+            t.intervalDays = read_i32(nvs, key("Days").c_str(), 30);
+            t.action = read_u8(nvs, key("Act").c_str(), 0);
+            t.target = read_str(nvs, key("Tgt").c_str(), "", 128);
+            t.payload = read_str(nvs, key("Pay").c_str(), "", 128);
+            t.lastRun = read_u32(nvs, key("Last").c_str(), 0);
+        }
+
         // 旧版(多通道之前)单通道配置一次性迁移：httpUrl/barkMode → 通道1
         if (!next.pushChannels[0].enabled && next.pushChannels[0].url.empty()) {
             std::string legacy_url = read_str(nvs, "httpUrl", "", 512);
@@ -305,15 +368,12 @@ esp_err_t idf_config_load(void)
         nvs_close(nvs);
     }
 
-    if (is_blank(next.webUser)) next.webUser = IDF_DEFAULT_WEB_USER;
-    if (is_blank(next.webPass)) next.webPass = IDF_DEFAULT_WEB_PASS;
-    if (next.kaUrl.empty()) next.kaUrl = IDF_KEEPALIVE_DEFAULT_URL;
-
     if (next.wifiSsid.empty() && WIFI_SSID[0]) {
         next.wifiSsid = WIFI_SSID;
         next.wifiPass = WIFI_PASS;
         next.wifiFromFallback = true;
     }
+    normalize_config(next);
 
     std::string log_wifi = next.wifiSsid;
     bool log_fallback = next.wifiFromFallback;
@@ -364,8 +424,10 @@ std::string idf_config_export_text(void)
     append_kv_i(out, "kaAction", c.kaAction);
     append_kv(out, "kaTarget", c.kaTarget);
     append_kv(out, "kaUrl", c.kaUrl);
+    append_kv(out, "kaProfile", c.kaProfile);
     append_kv_i(out, "kaLastTime", static_cast<int>(c.kaLastTime));
 
+    append_kv_i(out, "netLedEnabled", c.netLedEnabled ? 1 : 0);
     append_kv_i(out, "dataEnabled", c.dataEnabled ? 1 : 0);
     append_kv(out, "apn", c.apn);
     append_kv(out, "operatorPlmn", c.operatorPlmn);
@@ -388,6 +450,29 @@ std::string idf_config_export_text(void)
         append_kv(out, key, ch.key2);
         snprintf(key, sizeof(key), "push%dbody", i);
         append_kv(out, key, ch.customBody);
+    }
+
+    for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) {
+        char key[24];
+        const IdfSchedTask& t = c.schedTasks[i];
+        snprintf(key, sizeof(key), "st%dEn", i);
+        append_kv_i(out, key, t.enabled ? 1 : 0);
+        snprintf(key, sizeof(key), "st%dName", i);
+        append_kv(out, key, t.name);
+        snprintf(key, sizeof(key), "st%dProf", i);
+        append_kv(out, key, t.profile);
+        snprintf(key, sizeof(key), "st%dBack", i);
+        append_kv_i(out, key, t.switchBack ? 1 : 0);
+        snprintf(key, sizeof(key), "st%dDays", i);
+        append_kv_i(out, key, t.intervalDays);
+        snprintf(key, sizeof(key), "st%dAct", i);
+        append_kv_i(out, key, t.action);
+        snprintf(key, sizeof(key), "st%dTgt", i);
+        append_kv(out, key, t.target);
+        snprintf(key, sizeof(key), "st%dPay", i);
+        append_kv(out, key, t.payload);
+        snprintf(key, sizeof(key), "st%dLast", i);
+        append_kv_i(out, key, static_cast<int>(t.lastRun));
     }
     return out;
 }
@@ -419,11 +504,28 @@ static void apply_import_key(IdfConfig& c, const std::string& key, const std::st
     else if (key == "kaAction") c.kaAction = static_cast<uint8_t>(atoi(value.c_str()));
     else if (key == "kaTarget") c.kaTarget = value;
     else if (key == "kaUrl") c.kaUrl = value.empty() ? IDF_KEEPALIVE_DEFAULT_URL : value;
+    else if (key == "kaProfile") c.kaProfile = value;
     else if (key == "kaLastTime") c.kaLastTime = static_cast<uint32_t>(strtoul(value.c_str(), nullptr, 10));
+    else if (key == "netLedEnabled") c.netLedEnabled = bool_from_text(value);
     else if (key == "dataEnabled") c.dataEnabled = bool_from_text(value);
     else if (key == "apn") c.apn = value;
     else if (key == "operatorPlmn") c.operatorPlmn = value;
     else if (key == "phoneNumber") c.phoneNumber = value;
+    else if (key.rfind("st", 0) == 0 && key.size() > 3 && isdigit(static_cast<unsigned char>(key[2]))) {
+        int idx = key[2] - '0';
+        if (idx < 0 || idx >= IDF_MAX_SCHED_TASKS) return;
+        std::string suffix = key.substr(3);
+        IdfSchedTask& t = c.schedTasks[idx];
+        if (suffix == "En") t.enabled = bool_from_text(value);
+        else if (suffix == "Name") t.name = value;
+        else if (suffix == "Prof") t.profile = value;
+        else if (suffix == "Back") t.switchBack = bool_from_text(value);
+        else if (suffix == "Days") t.intervalDays = atoi(value.c_str());
+        else if (suffix == "Act") t.action = static_cast<uint8_t>(atoi(value.c_str()));
+        else if (suffix == "Tgt") t.target = value;
+        else if (suffix == "Pay") t.payload = value;
+        else if (suffix == "Last") t.lastRun = static_cast<uint32_t>(strtoul(value.c_str(), nullptr, 10));
+    }
     else if (key.rfind("push", 0) == 0) {
         size_t pos = 4;
         int idx = 0;
@@ -449,7 +551,8 @@ static void apply_import_key(IdfConfig& c, const std::string& key, const std::st
 esp_err_t idf_config_import_text(const std::string& text, int* applied_count)
 {
     if (text.empty()) return ESP_ERR_INVALID_ARG;
-    IdfConfig next = idf_config_get();
+    IdfConfig base = idf_config_get();
+    IdfConfig next = base;
     int applied = 0;
     size_t pos = 0;
     while (pos <= text.size()) {
@@ -473,52 +576,120 @@ esp_err_t idf_config_import_text(const std::string& text, int* applied_count)
         pos = end + 1;
     }
 
-    if (is_blank(next.webUser)) next.webUser = IDF_DEFAULT_WEB_USER;
-    if (is_blank(next.webPass)) next.webPass = IDF_DEFAULT_WEB_PASS;
-    if (next.kaUrl.empty()) next.kaUrl = IDF_KEEPALIVE_DEFAULT_URL;
     next.wifiFromFallback = false;
-
-    esp_err_t err = replace_config(next);
-    if (err == ESP_OK) err = save_config_to_nvs(next);
+    esp_err_t err = commit_config_update(next, base);
     if (err == ESP_OK && applied_count) *applied_count = applied;
     return err;
 }
 
 esp_err_t idf_config_factory_reset(void)
 {
-    nvs_handle_t nvs = 0;
-    esp_err_t err = nvs_open("sms_config", NVS_READWRITE, &nvs);
-    if (err == ESP_ERR_NVS_NOT_FOUND) {
-        return replace_config(IdfConfig());
-    }
+    esp_err_t err = ensure_config_mutex();
     if (err != ESP_OK) return err;
+    if (xSemaphoreTake(s_persist_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
+
+    nvs_handle_t nvs = 0;
+    err = nvs_open("sms_config", NVS_READWRITE, &nvs);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        err = replace_config(IdfConfig());
+        xSemaphoreGive(s_persist_mutex);
+        return err;
+    }
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_persist_mutex);
+        return err;
+    }
     err = nvs_erase_all(nvs);
     if (err == ESP_OK) err = nvs_commit(nvs);
     nvs_close(nvs);
     if (err == ESP_OK) {
         esp_err_t set_err = replace_config(IdfConfig());
-        if (set_err != ESP_OK) return set_err;
-        idf_log_line("配置已恢复出厂设置");
+        if (set_err != ESP_OK) {
+            err = set_err;
+        } else {
+            idf_log_line("配置已恢复出厂设置");
+        }
     }
+    xSemaphoreGive(s_persist_mutex);
     return err;
 }
 
 esp_err_t idf_config_set_keepalive_last(uint32_t epoch)
 {
     // 只改这一个字段并只写这一个 NVS key：
-    // 1) 快照-改-回写会和并发的 /save 互相覆盖(丢失更新)；2) 全量 45 键回写浪费 NVS 寿命
+    // 1) 快照-改-回写会和并发的 /save 互相覆盖(丢失更新)；2) 全量回写浪费 NVS 寿命
     esp_err_t err = ensure_config_mutex();
     if (err != ESP_OK) return err;
-    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-    s_config.kaLastTime = epoch;
-    xSemaphoreGive(s_config_mutex);
+    if (xSemaphoreTake(s_persist_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
 
     nvs_handle_t nvs = 0;
     err = nvs_open("sms_config", NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        err = nvs_set_u32(nvs, "kaLast", epoch);
+        if (err == ESP_OK) err = nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        s_config.kaLastTime = epoch;
+        xSemaphoreGive(s_config_mutex);
+    }
+    xSemaphoreGive(s_persist_mutex);
+    return err;
+}
+
+esp_err_t idf_config_set_sched_last(int index, uint32_t epoch)
+{
+    if (index < 0 || index >= IDF_MAX_SCHED_TASKS) return ESP_ERR_INVALID_ARG;
+    // 同 idf_config_set_keepalive_last：单字段单 key 更新，避免丢失更新与全量回写
+    esp_err_t err = ensure_config_mutex();
     if (err != ESP_OK) return err;
-    err = nvs_set_u32(nvs, "kaLast", epoch);
-    if (err == ESP_OK) err = nvs_commit(nvs);
-    nvs_close(nvs);
+    if (xSemaphoreTake(s_persist_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
+
+    nvs_handle_t nvs = 0;
+    err = nvs_open("sms_config", NVS_READWRITE, &nvs);
+    char key[16];
+    snprintf(key, sizeof(key), "st%dLast", index);
+    if (err == ESP_OK) {
+        err = nvs_set_u32(nvs, key, epoch);
+        if (err == ESP_OK) err = nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        s_config.schedTasks[index].lastRun = epoch;
+        xSemaphoreGive(s_config_mutex);
+    }
+    xSemaphoreGive(s_persist_mutex);
+    return err;
+}
+
+esp_err_t idf_config_set_net_led_enabled(bool enabled)
+{
+    // NET 灯只是一个布尔开关，单 key 写入即可；避免小表单走完整配置深拷贝/全量 NVS 回写
+    esp_err_t err = ensure_config_mutex();
+    if (err != ESP_OK) return err;
+    if (xSemaphoreTake(s_persist_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
+
+    nvs_handle_t nvs = 0;
+    err = nvs_open("sms_config", NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(nvs, "netLed", enabled ? 1 : 0);
+        if (err == ESP_OK) err = nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        s_config.netLedEnabled = enabled;
+        xSemaphoreGive(s_config_mutex);
+    } else {
+        ESP_LOGE(TAG, "保存 NET 指示灯配置失败: %s", esp_err_to_name(err));
+        idf_logf("保存 NET 指示灯配置失败: %s", esp_err_to_name(err));
+    }
+    xSemaphoreGive(s_persist_mutex);
     return err;
 }
 
@@ -549,6 +720,7 @@ static esp_err_t save_config_to_nvs(const IdfConfig& c)
     if (err == ESP_OK) err = nvs_set_u8(nvs, "kaAct", c.kaAction);
     if (err == ESP_OK) err = write_str(nvs, "kaTarget", c.kaTarget);
     if (err == ESP_OK) err = write_str(nvs, "kaUrl", c.kaUrl.empty() ? IDF_KEEPALIVE_DEFAULT_URL : c.kaUrl);
+    if (err == ESP_OK) err = write_str(nvs, "kaProfile", c.kaProfile);
     if (err == ESP_OK) err = nvs_set_u32(nvs, "kaLast", c.kaLastTime);
 
     if (err == ESP_OK) err = nvs_set_i32(nvs, "tzMin", c.tzOffsetMin);
@@ -558,6 +730,7 @@ static esp_err_t save_config_to_nvs(const IdfConfig& c)
     if (err == ESP_OK) err = nvs_set_u8(nvs, "hbEn", c.hbEnabled ? 1 : 0);
     if (err == ESP_OK) err = nvs_set_i32(nvs, "hbHour", c.hbHour);
 
+    if (err == ESP_OK) err = nvs_set_u8(nvs, "netLed", c.netLedEnabled ? 1 : 0);
     if (err == ESP_OK) err = nvs_set_u8(nvs, "dataEn", c.dataEnabled ? 1 : 0);
     if (err == ESP_OK) err = write_str(nvs, "apn", c.apn);
     if (err == ESP_OK) err = write_str(nvs, "opPlmn", c.operatorPlmn);
@@ -581,6 +754,24 @@ static esp_err_t save_config_to_nvs(const IdfConfig& c)
         if (err == ESP_OK) err = write_str(nvs, key("body").c_str(), ch.customBody);
     }
 
+    for (int i = 0; err == ESP_OK && i < IDF_MAX_SCHED_TASKS; ++i) {
+        auto key = [&](const char* suffix) {
+            char buf[16];
+            snprintf(buf, sizeof(buf), "st%d%s", i, suffix);
+            return std::string(buf);
+        };
+        const IdfSchedTask& t = c.schedTasks[i];
+        if (err == ESP_OK) err = nvs_set_u8(nvs, key("En").c_str(), t.enabled ? 1 : 0);
+        if (err == ESP_OK) err = write_str(nvs, key("Name").c_str(), t.name);
+        if (err == ESP_OK) err = write_str(nvs, key("Prof").c_str(), t.profile);
+        if (err == ESP_OK) err = nvs_set_u8(nvs, key("Back").c_str(), t.switchBack ? 1 : 0);
+        if (err == ESP_OK) err = nvs_set_i32(nvs, key("Days").c_str(), t.intervalDays);
+        if (err == ESP_OK) err = nvs_set_u8(nvs, key("Act").c_str(), t.action);
+        if (err == ESP_OK) err = write_str(nvs, key("Tgt").c_str(), t.target);
+        if (err == ESP_OK) err = write_str(nvs, key("Pay").c_str(), t.payload);
+        if (err == ESP_OK) err = nvs_set_u32(nvs, key("Last").c_str(), t.lastRun);
+    }
+
     if (err == ESP_OK) err = nvs_commit(nvs);
     nvs_close(nvs);
     if (err != ESP_OK) {
@@ -592,115 +783,450 @@ static esp_err_t save_config_to_nvs(const IdfConfig& c)
     return err;
 }
 
+static void merge_runtime_markers(IdfConfig& next, const IdfConfig& base)
+{
+    // kaLast/stXLast 是运行时进度。若本次保存没有主动改它们，就带上最新 RAM 值，
+    // 避免慢速整包 NVS 保存把后台调度器刚写入的进度回滚。
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    if (next.kaLastTime == base.kaLastTime) next.kaLastTime = s_config.kaLastTime;
+    for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) {
+        if (next.schedTasks[i].lastRun == base.schedTasks[i].lastRun) {
+            next.schedTasks[i].lastRun = s_config.schedTasks[i].lastRun;
+        }
+    }
+    xSemaphoreGive(s_config_mutex);
+}
+
+static esp_err_t begin_field_save(nvs_handle_t* out)
+{
+    esp_err_t err = ensure_config_mutex();
+    if (err != ESP_OK) return err;
+    if (xSemaphoreTake(s_persist_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
+
+    nvs_handle_t nvs = 0;
+    err = nvs_open("sms_config", NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_persist_mutex);
+        return err;
+    }
+    *out = nvs;
+    return ESP_OK;
+}
+
+static esp_err_t commit_field_save(nvs_handle_t nvs, esp_err_t err, const char* label)
+{
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "保存%s失败: %s", label, esp_err_to_name(err));
+        idf_logf("保存%s失败: %s", label, esp_err_to_name(err));
+    }
+    return err;
+}
+
+static esp_err_t commit_config_update(IdfConfig& next, const IdfConfig& base)
+{
+    esp_err_t err = ensure_config_mutex();
+    if (err != ESP_OK) return err;
+    normalize_config(next);
+
+    if (xSemaphoreTake(s_persist_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
+    merge_runtime_markers(next, base);
+    err = save_config_to_nvs(next);
+    if (err == ESP_OK) err = replace_config(next);
+    xSemaphoreGive(s_persist_mutex);
+    return err;
+}
+
 esp_err_t idf_config_save(void)
 {
-    return save_config_to_nvs(idf_config_get());
+    IdfConfig base = idf_config_get();
+    IdfConfig next = base;
+    return commit_config_update(next, base);
 }
 
 esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass)
 {
     if (ssid.empty() || ssid.size() > 32 || pass.size() > 64) return ESP_ERR_INVALID_ARG;
-    IdfConfig next = idf_config_get();
-    next.wifiSsid = ssid;
-    next.wifiPass = pass;
-    next.wifiFromFallback = false;
-    esp_err_t err = replace_config(next);
+    std::string next_ssid = ssid;
+    std::string next_pass = pass;
+    limit_utf8_bytes(next_ssid, 64);
+    limit_utf8_bytes(next_pass, 128);
+
+    nvs_handle_t nvs = 0;
+    esp_err_t err = begin_field_save(&nvs);
     if (err != ESP_OK) return err;
-    return save_config_to_nvs(next);
+    if (err == ESP_OK) err = write_str(nvs, "wifiSsid", next_ssid);
+    if (err == ESP_OK) err = write_str(nvs, "wifiPass", next_pass);
+    err = commit_field_save(nvs, err, "WiFi 配置");
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        s_config.wifiSsid = next_ssid;
+        s_config.wifiPass = next_pass;
+        s_config.wifiFromFallback = false;
+        xSemaphoreGive(s_config_mutex);
+    }
+    xSemaphoreGive(s_persist_mutex);
+    return err;
 }
 
-esp_err_t idf_config_update_from_form(const IdfFormFields& fields)
+esp_err_t idf_config_save_account(const std::string& user, const std::string& pass)
 {
-    IdfConfig next = idf_config_get();
+    esp_err_t mutex_err = ensure_config_mutex();
+    if (mutex_err != ESP_OK) return mutex_err;
 
-    if (const std::string* v = find_field(fields, "webUser"); v && !is_blank(*v)) next.webUser = *v;
-    if (const std::string* v = find_field(fields, "webPass"); v && !is_blank(*v)) next.webPass = *v;
+    std::string next_user = user;
+    std::string next_pass = pass;
+    limit_utf8_bytes(next_user, 64);
+    limit_utf8_bytes(next_pass, 128);
 
-    if (const std::string* v = find_field(fields, "smtpServer")) next.smtpServer = trim_copy(*v);
-    {
-        int port = to_int(find_field(fields, "smtpPort"), next.smtpPort);
-        next.smtpPort = (port > 0 && port <= 65535) ? port : 465;  // 0/非法回落默认 SSL 端口
+    if (is_blank(next_user) || is_blank(next_pass)) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        if (is_blank(next_user)) next_user = s_config.webUser;
+        if (is_blank(next_pass)) next_pass = s_config.webPass;
+        xSemaphoreGive(s_config_mutex);
     }
-    if (const std::string* v = find_field(fields, "smtpUser")) next.smtpUser = *v;
-    if (const std::string* v = find_field(fields, "smtpPass")) next.smtpPass = *v;
-    if (const std::string* v = find_field(fields, "smtpSendTo")) next.smtpSendTo = *v;
-    if (has_field(fields, "emailForm")) next.emailEnabled = has_field(fields, "emailEnabled");
+    if (is_blank(next_user)) next_user = IDF_DEFAULT_WEB_USER;
+    if (is_blank(next_pass)) next_pass = IDF_DEFAULT_WEB_PASS;
 
-    if (const std::string* v = find_field(fields, "adminPhone")) next.adminPhone = *v;
-    if (const std::string* v = find_field(fields, "numberBlackList")) next.numberBlackList = *v;
-    if (const std::string* v = find_field(fields, "forwardRules")) next.forwardRules = *v;
+    nvs_handle_t nvs = 0;
+    esp_err_t err = begin_field_save(&nvs);
+    if (err != ESP_OK) return err;
+    if (err == ESP_OK) err = write_str(nvs, "webUser", next_user);
+    if (err == ESP_OK) err = write_str(nvs, "webPass", next_pass);
+    err = commit_field_save(nvs, err, "管理账号");
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        s_config.webUser = next_user;
+        s_config.webPass = next_pass;
+        xSemaphoreGive(s_config_mutex);
+    }
+    xSemaphoreGive(s_persist_mutex);
+    return err;
+}
 
-    if (has_field(fields, "pushForm")) {
-        next.pushEnabled = has_field(fields, "pushEnabled");
-        for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
-            char key[24];
-            snprintf(key, sizeof(key), "push%den", i);
-            next.pushChannels[i].enabled = has_field(fields, key);
-            snprintf(key, sizeof(key), "push%dtype", i);
-            uint8_t type = to_u8(find_field(fields, key), next.pushChannels[i].type);
-            next.pushChannels[i].type = (type >= 1 && type <= 10) ? type : 1;  // 越界回落 POST JSON
-            snprintf(key, sizeof(key), "push%durl", i);
-            if (const std::string* v = find_field(fields, key)) next.pushChannels[i].url = trim_copy(*v);
-            snprintf(key, sizeof(key), "push%dname", i);
-            if (const std::string* v = find_field(fields, key)) {
-                std::string name = trim_copy(*v);
-                next.pushChannels[i].name = name.empty() ? channel_default_name(i) : name;
-            }
-            snprintf(key, sizeof(key), "push%dkey1", i);
-            if (const std::string* v = find_field(fields, key)) next.pushChannels[i].key1 = trim_copy(*v);
-            snprintf(key, sizeof(key), "push%dkey2", i);
-            if (const std::string* v = find_field(fields, key)) next.pushChannels[i].key2 = trim_copy(*v);
-            snprintf(key, sizeof(key), "push%dbody", i);
-            if (const std::string* v = find_field(fields, key)) next.pushChannels[i].customBody = *v;
+esp_err_t idf_config_save_time(int tz_offset_min, const std::string& ntp_server)
+{
+    int next_tz = clamp_int(tz_offset_min, -720, 840);
+    std::string next_ntp = ntp_server;
+    limit_utf8_bytes(next_ntp, 128);
 
-            // Server酱常见误填：把 SendKey 粘到了 URL 框——自动搬到 key1
-            IdfPushChannel& ch = next.pushChannels[i];
-            // Bark 常见误填：只把 Device Key 粘到了 URL 框——自动搬到 key1，URL 留空走官方服务
-            if (ch.type == 2 && ch.key1.empty() && !ch.url.empty() && !looks_like_url(ch.url)) {
-                ch.key1 = ch.url;
-                ch.url.clear();
-            }
-            if (ch.type == 6 && ch.key1.empty() && !ch.url.empty() && !looks_like_url(ch.url)) {
-                ch.key1 = ch.url;
-                ch.url.clear();
-            }
+    nvs_handle_t nvs = 0;
+    esp_err_t err = begin_field_save(&nvs);
+    if (err != ESP_OK) return err;
+    if (err == ESP_OK) err = nvs_set_i32(nvs, "tzMin", next_tz);
+    if (err == ESP_OK) err = write_str(nvs, "ntpSrv", next_ntp);
+    err = commit_field_save(nvs, err, "时间设置");
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        s_config.tzOffsetMin = next_tz;
+        s_config.ntpServer = next_ntp;
+        xSemaphoreGive(s_config_mutex);
+    }
+    xSemaphoreGive(s_persist_mutex);
+    return err;
+}
+
+esp_err_t idf_config_save_email(bool enabled, const std::string& server, int port,
+                                const std::string& user, const std::string& pass,
+                                const std::string& send_to)
+{
+    std::string next_server = trim_copy(server);
+    std::string next_user = user;
+    std::string next_pass = pass;
+    std::string next_send_to = send_to;
+    int next_port = (port > 0 && port <= 65535) ? port : 465;
+    limit_utf8_bytes(next_server, 128);
+    limit_utf8_bytes(next_user, 128);
+    limit_utf8_bytes(next_pass, 256);
+    limit_utf8_bytes(next_send_to, 256);
+
+    nvs_handle_t nvs = 0;
+    esp_err_t err = begin_field_save(&nvs);
+    if (err != ESP_OK) return err;
+    if (err == ESP_OK) err = write_str(nvs, "smtpServer", next_server);
+    if (err == ESP_OK) err = nvs_set_i32(nvs, "smtpPort", next_port);
+    if (err == ESP_OK) err = write_str(nvs, "smtpUser", next_user);
+    if (err == ESP_OK) err = write_str(nvs, "smtpPass", next_pass);
+    if (err == ESP_OK) err = write_str(nvs, "smtpSendTo", next_send_to);
+    if (err == ESP_OK) err = nvs_set_u8(nvs, "emailEn", enabled ? 1 : 0);
+    err = commit_field_save(nvs, err, "邮件配置");
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        s_config.smtpServer = next_server;
+        s_config.smtpPort = next_port;
+        s_config.smtpUser = next_user;
+        s_config.smtpPass = next_pass;
+        s_config.smtpSendTo = next_send_to;
+        s_config.emailEnabled = enabled;
+        xSemaphoreGive(s_config_mutex);
+    }
+    xSemaphoreGive(s_persist_mutex);
+    return err;
+}
+
+static void normalize_push_channel_for_save(IdfPushChannel& ch, int index)
+{
+    ch.type = (ch.type >= 1 && ch.type <= 10) ? ch.type : 1;
+    ch.url = trim_copy(ch.url);
+    ch.name = trim_copy(ch.name);
+    ch.key1 = trim_copy(ch.key1);
+    ch.key2 = trim_copy(ch.key2);
+    if (ch.name.empty()) ch.name = channel_default_name(index);
+    if (ch.type == 2 && ch.key1.empty() && !ch.url.empty() && !looks_like_url(ch.url)) {
+        ch.key1 = ch.url;
+        ch.url.clear();
+    }
+    if (ch.type == 6 && ch.key1.empty() && !ch.url.empty() && !looks_like_url(ch.url)) {
+        ch.key1 = ch.url;
+        ch.url.clear();
+    }
+    limit_utf8_bytes(ch.name, 64);
+    limit_utf8_bytes(ch.url, 512);
+    limit_utf8_bytes(ch.key1, 256);
+    limit_utf8_bytes(ch.key2, 512);
+    limit_utf8_bytes(ch.customBody, 1024);
+}
+
+esp_err_t idf_config_save_push(bool enabled, const IdfPushChannel channels[IDF_MAX_PUSH_CHANNELS])
+{
+    IdfPushChannel next[IDF_MAX_PUSH_CHANNELS];
+    for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
+        next[i] = channels[i];
+        normalize_push_channel_for_save(next[i], i);
+    }
+
+    nvs_handle_t nvs = 0;
+    esp_err_t err = begin_field_save(&nvs);
+    if (err != ESP_OK) return err;
+    if (err == ESP_OK) err = nvs_set_u8(nvs, "pushEn", enabled ? 1 : 0);
+    for (int i = 0; err == ESP_OK && i < IDF_MAX_PUSH_CHANNELS; ++i) {
+        char prefix[12];
+        snprintf(prefix, sizeof(prefix), "push%d", i);
+        auto key = [&](const char* suffix) {
+            char buf[24];
+            snprintf(buf, sizeof(buf), "%s%s", prefix, suffix);
+            return std::string(buf);
+        };
+        const IdfPushChannel& ch = next[i];
+        if (err == ESP_OK) err = nvs_set_u8(nvs, key("en").c_str(), ch.enabled ? 1 : 0);
+        if (err == ESP_OK) err = nvs_set_u8(nvs, key("type").c_str(), ch.type);
+        if (err == ESP_OK) err = write_str(nvs, key("url").c_str(), ch.url);
+        if (err == ESP_OK) err = write_str(nvs, key("name").c_str(), ch.name);
+        if (err == ESP_OK) err = write_str(nvs, key("k1").c_str(), ch.key1);
+        if (err == ESP_OK) err = write_str(nvs, key("k2").c_str(), ch.key2);
+        if (err == ESP_OK) err = write_str(nvs, key("body").c_str(), ch.customBody);
+    }
+    err = commit_field_save(nvs, err, "推送通道");
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        s_config.pushEnabled = enabled;
+        for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) s_config.pushChannels[i] = next[i];
+        xSemaphoreGive(s_config_mutex);
+    }
+    xSemaphoreGive(s_persist_mutex);
+    return err;
+}
+
+esp_err_t idf_config_save_filter(const std::string& admin_phone, const std::string& number_blacklist)
+{
+    std::string next_admin = admin_phone;
+    std::string next_blacklist = number_blacklist;
+    limit_utf8_bytes(next_admin, 64);
+    limit_utf8_bytes(next_blacklist, 1024);
+
+    nvs_handle_t nvs = 0;
+    esp_err_t err = begin_field_save(&nvs);
+    if (err != ESP_OK) return err;
+    if (err == ESP_OK) err = write_str(nvs, "adminPhone", next_admin);
+    if (err == ESP_OK) err = write_str(nvs, "numBlkList", next_blacklist);
+    err = commit_field_save(nvs, err, "权限与过滤");
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        s_config.adminPhone = next_admin;
+        s_config.numberBlackList = next_blacklist;
+        xSemaphoreGive(s_config_mutex);
+    }
+    xSemaphoreGive(s_persist_mutex);
+    return err;
+}
+
+esp_err_t idf_config_save_forward_rules(const std::string& rules)
+{
+    std::string next_rules = rules;
+    limit_utf8_bytes(next_rules, 2048);
+
+    nvs_handle_t nvs = 0;
+    esp_err_t err = begin_field_save(&nvs);
+    if (err != ESP_OK) return err;
+    if (err == ESP_OK) err = write_str(nvs, "fwdRules", next_rules);
+    err = commit_field_save(nvs, err, "转发规则");
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        s_config.forwardRules = next_rules;
+        xSemaphoreGive(s_config_mutex);
+    }
+    xSemaphoreGive(s_persist_mutex);
+    return err;
+}
+
+esp_err_t idf_config_save_keepalive(bool enabled, int interval_days, uint8_t action,
+                                    const std::string& target, const std::string& url,
+                                    const std::string& profile)
+{
+    esp_err_t mutex_err = ensure_config_mutex();
+    if (mutex_err != ESP_OK) return mutex_err;
+
+    int next_days = interval_days;
+    uint8_t next_action = action;
+    if (next_days < 1 || next_days > 3650 || next_action > 3) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        if (next_days < 1 || next_days > 3650) next_days = s_config.kaIntervalDays;
+        if (next_action > 3) next_action = s_config.kaAction <= 3 ? s_config.kaAction : 1;
+        xSemaphoreGive(s_config_mutex);
+    }
+
+    std::string next_target = target;
+    std::string next_url = url.empty() ? std::string(IDF_KEEPALIVE_DEFAULT_URL) : url;
+    std::string next_profile = trim_copy(profile);
+    limit_utf8_bytes(next_target, 64);
+    limit_utf8_bytes(next_url, 256);
+    limit_utf8_bytes(next_profile, 64);
+
+    nvs_handle_t nvs = 0;
+    esp_err_t err = begin_field_save(&nvs);
+    if (err != ESP_OK) return err;
+    if (err == ESP_OK) err = nvs_set_u8(nvs, "kaEn", enabled ? 1 : 0);
+    if (err == ESP_OK) err = nvs_set_i32(nvs, "kaDays", next_days);
+    if (err == ESP_OK) err = nvs_set_u8(nvs, "kaAct", next_action);
+    if (err == ESP_OK) err = write_str(nvs, "kaTarget", next_target);
+    if (err == ESP_OK) err = write_str(nvs, "kaUrl", next_url);
+    if (err == ESP_OK) err = write_str(nvs, "kaProfile", next_profile);
+    err = commit_field_save(nvs, err, "保号任务");
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        s_config.kaEnabled = enabled;
+        s_config.kaIntervalDays = next_days;
+        s_config.kaAction = next_action;
+        s_config.kaTarget = next_target;
+        s_config.kaUrl = next_url;
+        s_config.kaProfile = next_profile;
+        xSemaphoreGive(s_config_mutex);
+    }
+    xSemaphoreGive(s_persist_mutex);
+    return err;
+}
+
+esp_err_t idf_config_save_system_schedule(bool reboot_enabled, int reboot_hour,
+                                          bool hb_enabled, int hb_hour)
+{
+    int next_reboot_hour = clamp_int(reboot_hour, 0, 23);
+    int next_hb_hour = clamp_int(hb_hour, 0, 23);
+
+    nvs_handle_t nvs = 0;
+    esp_err_t err = begin_field_save(&nvs);
+    if (err != ESP_OK) return err;
+    if (err == ESP_OK) err = nvs_set_u8(nvs, "rbEn", reboot_enabled ? 1 : 0);
+    if (err == ESP_OK) err = nvs_set_i32(nvs, "rbHour", next_reboot_hour);
+    if (err == ESP_OK) err = nvs_set_u8(nvs, "hbEn", hb_enabled ? 1 : 0);
+    if (err == ESP_OK) err = nvs_set_i32(nvs, "hbHour", next_hb_hour);
+    err = commit_field_save(nvs, err, "系统定时");
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        s_config.rebootEnabled = reboot_enabled;
+        s_config.rebootHour = next_reboot_hour;
+        s_config.hbEnabled = hb_enabled;
+        s_config.hbHour = next_hb_hour;
+        xSemaphoreGive(s_config_mutex);
+    }
+    xSemaphoreGive(s_persist_mutex);
+    return err;
+}
+
+esp_err_t idf_config_save_sched_tasks(const IdfSchedTask tasks[IDF_MAX_SCHED_TASKS])
+{
+    esp_err_t mutex_err = ensure_config_mutex();
+    if (mutex_err != ESP_OK) return mutex_err;
+
+    IdfSchedTask next[IDF_MAX_SCHED_TASKS];
+    bool was_enabled[IDF_MAX_SCHED_TASKS] = {};
+    uint32_t last_run[IDF_MAX_SCHED_TASKS] = {};
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) {
+        was_enabled[i] = s_config.schedTasks[i].enabled;
+        last_run[i] = s_config.schedTasks[i].lastRun;
+    }
+    xSemaphoreGive(s_config_mutex);
+
+    uint32_t now = static_cast<uint32_t>(time(nullptr));
+    for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) {
+        next[i] = tasks[i];
+        limit_utf8_bytes(next[i].name, 32);
+        limit_utf8_bytes(next[i].profile, 64);
+        next[i].intervalDays = clamp_int(next[i].intervalDays, 1, 3650);
+        if (next[i].action > 3) next[i].action = 0;
+        limit_utf8_bytes(next[i].target, 128);
+        limit_utf8_bytes(next[i].payload, 128);
+        next[i].lastRun = last_run[i];
+        if (next[i].enabled && !was_enabled[i] && next[i].lastRun == 0 && now >= 1700000000u) {
+            next[i].lastRun = now;
         }
     }
 
-    if (has_field(fields, "kaForm")) {
-        next.kaEnabled = has_field(fields, "kaEnabled");
-        // 0/负数会让保号"每小时都到期"，反复发短信/USSD/跑流量——只接受 1~3650 天
-        int ka_days = to_int(find_field(fields, "kaIntervalDays"), next.kaIntervalDays);
-        if (ka_days >= 1 && ka_days <= 3650) next.kaIntervalDays = ka_days;
-        next.kaAction = to_u8(find_field(fields, "kaAction"), next.kaAction);
-        if (const std::string* v = find_field(fields, "kaTarget")) next.kaTarget = *v;
-        if (const std::string* v = find_field(fields, "kaUrl")) next.kaUrl = v->empty() ? IDF_KEEPALIVE_DEFAULT_URL : *v;
-    }
-
-    if (has_field(fields, "tzForm")) {
-        next.tzOffsetMin = to_int(find_field(fields, "tzOffsetMin"), next.tzOffsetMin);
-        if (next.tzOffsetMin < -720) next.tzOffsetMin = -720;
-        if (next.tzOffsetMin > 840) next.tzOffsetMin = 840;
-        if (const std::string* v = find_field(fields, "ntpServer")) next.ntpServer = *v;
-    }
-
-    if (has_field(fields, "schedForm")) {
-        next.rebootEnabled = has_field(fields, "rebootEnabled");
-        next.rebootHour = clamp_int(to_int(find_field(fields, "rebootHour"), next.rebootHour), 0, 23);
-        next.hbEnabled = has_field(fields, "hbEnabled");
-        next.hbHour = clamp_int(to_int(find_field(fields, "hbHour"), next.hbHour), 0, 23);
-    }
-
-    if (has_field(fields, "simForm")) {
-        next.dataEnabled = has_field(fields, "dataEnabled");
-        if (const std::string* v = find_field(fields, "apn")) next.apn = *v;
-        if (const std::string* v = find_field(fields, "operatorPlmn")) next.operatorPlmn = *v;
-        if (const std::string* v = find_field(fields, "phoneNumber")) next.phoneNumber = *v;
-    }
-
-    esp_err_t err = replace_config(next);
+    nvs_handle_t nvs = 0;
+    esp_err_t err = begin_field_save(&nvs);
     if (err != ESP_OK) return err;
-    return save_config_to_nvs(next);
+    for (int i = 0; err == ESP_OK && i < IDF_MAX_SCHED_TASKS; ++i) {
+        auto key = [&](const char* suffix) {
+            char buf[16];
+            snprintf(buf, sizeof(buf), "st%d%s", i, suffix);
+            return std::string(buf);
+        };
+        const IdfSchedTask& t = next[i];
+        if (err == ESP_OK) err = nvs_set_u8(nvs, key("En").c_str(), t.enabled ? 1 : 0);
+        if (err == ESP_OK) err = write_str(nvs, key("Name").c_str(), t.name);
+        if (err == ESP_OK) err = write_str(nvs, key("Prof").c_str(), t.profile);
+        if (err == ESP_OK) err = nvs_set_u8(nvs, key("Back").c_str(), t.switchBack ? 1 : 0);
+        if (err == ESP_OK) err = nvs_set_i32(nvs, key("Days").c_str(), t.intervalDays);
+        if (err == ESP_OK) err = nvs_set_u8(nvs, key("Act").c_str(), t.action);
+        if (err == ESP_OK) err = write_str(nvs, key("Tgt").c_str(), t.target);
+        if (err == ESP_OK) err = write_str(nvs, key("Pay").c_str(), t.payload);
+        if (err == ESP_OK) err = nvs_set_u32(nvs, key("Last").c_str(), t.lastRun);
+    }
+    err = commit_field_save(nvs, err, "自定义定时任务");
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) s_config.schedTasks[i] = next[i];
+        xSemaphoreGive(s_config_mutex);
+    }
+    xSemaphoreGive(s_persist_mutex);
+    return err;
+}
+
+esp_err_t idf_config_save_sim(bool data_enabled, const std::string& apn,
+                              const std::string& operator_plmn)
+{
+    std::string next_apn = apn;
+    std::string next_operator = operator_plmn;
+    limit_utf8_bytes(next_apn, 96);
+    limit_utf8_bytes(next_operator, 16);
+
+    nvs_handle_t nvs = 0;
+    esp_err_t err = begin_field_save(&nvs);
+    if (err != ESP_OK) return err;
+    if (err == ESP_OK) err = nvs_set_u8(nvs, "dataEn", data_enabled ? 1 : 0);
+    if (err == ESP_OK) err = write_str(nvs, "apn", next_apn);
+    if (err == ESP_OK) err = write_str(nvs, "opPlmn", next_operator);
+    err = commit_field_save(nvs, err, "蜂窝设置");
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        s_config.dataEnabled = data_enabled;
+        s_config.apn = next_apn;
+        s_config.operatorPlmn = next_operator;
+        xSemaphoreGive(s_config_mutex);
+    }
+    xSemaphoreGive(s_persist_mutex);
+    return err;
 }
 
 IdfConfig idf_config_get(void)
@@ -730,6 +1256,213 @@ IdfConfigStatusView idf_config_get_status_view(void)
     return view;
 }
 
+IdfConfigWebView idf_config_get_web_view(void)
+{
+    IdfConfigWebView view;
+    if (ensure_config_mutex() != ESP_OK) return view;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    view.webUser = s_config.webUser;
+    view.webPass = s_config.webPass;
+    view.smtpServer = s_config.smtpServer;
+    view.smtpPort = s_config.smtpPort;
+    view.smtpUser = s_config.smtpUser;
+    view.smtpPass = s_config.smtpPass;
+    view.smtpSendTo = s_config.smtpSendTo;
+    view.adminPhone = s_config.adminPhone;
+    view.numberBlackList = s_config.numberBlackList;
+    view.forwardRules = s_config.forwardRules;
+    view.emailEnabled = s_config.emailEnabled;
+    view.pushEnabled = s_config.pushEnabled;
+    view.ntpServer = s_config.ntpServer;
+    view.tzOffsetMin = s_config.tzOffsetMin;
+    view.rebootEnabled = s_config.rebootEnabled;
+    view.rebootHour = s_config.rebootHour;
+    view.hbEnabled = s_config.hbEnabled;
+    view.hbHour = s_config.hbHour;
+    view.dataEnabled = s_config.dataEnabled;
+    view.apn = s_config.apn;
+    view.phoneNumber = s_config.phoneNumber;
+    view.operatorPlmn = s_config.operatorPlmn;
+    view.kaProfile = s_config.kaProfile;
+    view.netLedEnabled = s_config.netLedEnabled;
+    view.emailConfigured = !s_config.smtpServer.empty() && !s_config.smtpUser.empty() &&
+                           !s_config.smtpPass.empty() && !s_config.smtpSendTo.empty();
+    for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
+        view.pushChannels[i] = s_config.pushChannels[i];
+        if (s_config.pushChannels[i].enabled) ++view.pushEnabledCount;
+    }
+    xSemaphoreGive(s_config_mutex);
+    return view;
+}
+
+IdfSchedStatusView idf_config_get_sched_view(void)
+{
+    IdfSchedStatusView view;
+    if (ensure_config_mutex() != ESP_OK) return view;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) view.tasks[i] = s_config.schedTasks[i];
+    view.tzOffsetMin = s_config.tzOffsetMin;
+    xSemaphoreGive(s_config_mutex);
+    return view;
+}
+
+IdfKeepaliveStatusView idf_config_get_keepalive_status_view(void)
+{
+    IdfKeepaliveStatusView view;
+    if (ensure_config_mutex() != ESP_OK) return view;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    view.kaEnabled = s_config.kaEnabled;
+    view.kaIntervalDays = s_config.kaIntervalDays;
+    view.kaAction = s_config.kaAction;
+    view.kaTarget = s_config.kaTarget;
+    view.kaUrl = s_config.kaUrl;
+    view.kaProfile = s_config.kaProfile;
+    view.kaLastTime = s_config.kaLastTime;
+    view.tzOffsetMin = s_config.tzOffsetMin;
+    xSemaphoreGive(s_config_mutex);
+    return view;
+}
+
+IdfKeepaliveRunView idf_config_get_keepalive_run_view(void)
+{
+    IdfKeepaliveRunView view;
+    if (ensure_config_mutex() != ESP_OK) return view;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    view.kaEnabled = s_config.kaEnabled;
+    view.kaIntervalDays = s_config.kaIntervalDays;
+    view.kaAction = s_config.kaAction;
+    view.kaTarget = s_config.kaTarget;
+    view.kaUrl = s_config.kaUrl;
+    view.kaProfile = s_config.kaProfile;
+    view.kaLastTime = s_config.kaLastTime;
+    view.tzOffsetMin = s_config.tzOffsetMin;
+    view.emailEnabled = s_config.emailEnabled;
+    view.dataEnabled = s_config.dataEnabled;
+    view.apn = s_config.apn;
+    xSemaphoreGive(s_config_mutex);
+    return view;
+}
+
+IdfSchedRunView idf_config_get_sched_run_view(int index)
+{
+    IdfSchedRunView view;
+    if (index < 0 || index >= IDF_MAX_SCHED_TASKS) return view;
+    if (ensure_config_mutex() != ESP_OK) return view;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    view.valid = true;
+    view.task = s_config.schedTasks[index];
+    view.kaUrl = s_config.kaUrl;
+    view.tzOffsetMin = s_config.tzOffsetMin;
+    view.emailEnabled = s_config.emailEnabled;
+    view.emailConfigured = !s_config.smtpServer.empty() && !s_config.smtpUser.empty() &&
+                           !s_config.smtpPass.empty() && !s_config.smtpSendTo.empty();
+    view.dataEnabled = s_config.dataEnabled;
+    view.apn = s_config.apn;
+    xSemaphoreGive(s_config_mutex);
+    return view;
+}
+
+IdfSimSettingsView idf_config_get_sim_settings_view(void)
+{
+    IdfSimSettingsView view;
+    if (ensure_config_mutex() != ESP_OK) return view;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    view.dataEnabled = s_config.dataEnabled;
+    view.apn = s_config.apn;
+    view.operatorPlmn = s_config.operatorPlmn;
+    xSemaphoreGive(s_config_mutex);
+    return view;
+}
+
+IdfSmsProcessView idf_config_get_sms_process_view(void)
+{
+    IdfSmsProcessView view;
+    if (ensure_config_mutex() != ESP_OK) return view;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    view.adminPhone = s_config.adminPhone;
+    view.numberBlackList = s_config.numberBlackList;
+    view.tzOffsetMin = s_config.tzOffsetMin;
+    xSemaphoreGive(s_config_mutex);
+    return view;
+}
+
+static bool email_configured_locked()
+{
+    return !s_config.smtpServer.empty() && !s_config.smtpUser.empty() &&
+           !s_config.smtpPass.empty() && !s_config.smtpSendTo.empty();
+}
+
+IdfPushForwardView idf_config_get_push_forward_view(void)
+{
+    IdfPushForwardView view;
+    if (ensure_config_mutex() != ESP_OK) return view;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    view.forwardRules = s_config.forwardRules;
+    view.pushEnabled = s_config.pushEnabled;
+    view.emailEnabled = s_config.emailEnabled;
+    view.emailConfigured = email_configured_locked();
+    for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) view.pushChannels[i] = s_config.pushChannels[i];
+    xSemaphoreGive(s_config_mutex);
+    return view;
+}
+
+IdfPushNotifyView idf_config_get_push_notify_view(void)
+{
+    IdfPushNotifyView view;
+    if (ensure_config_mutex() != ESP_OK) return view;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    view.pushEnabled = s_config.pushEnabled;
+    view.tzOffsetMin = s_config.tzOffsetMin;
+    for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) view.pushChannels[i] = s_config.pushChannels[i];
+    xSemaphoreGive(s_config_mutex);
+    return view;
+}
+
+IdfEmailSettingsView idf_config_get_email_settings_view(void)
+{
+    IdfEmailSettingsView view;
+    if (ensure_config_mutex() != ESP_OK) return view;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    view.emailEnabled = s_config.emailEnabled;
+    view.emailConfigured = email_configured_locked();
+    view.smtpServer = s_config.smtpServer;
+    view.smtpPort = s_config.smtpPort;
+    view.smtpUser = s_config.smtpUser;
+    view.smtpPass = s_config.smtpPass;
+    view.smtpSendTo = s_config.smtpSendTo;
+    xSemaphoreGive(s_config_mutex);
+    return view;
+}
+
+IdfSchedulerView idf_config_get_scheduler_view(void)
+{
+    IdfSchedulerView view;
+    if (ensure_config_mutex() != ESP_OK) return view;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    view.kaEnabled = s_config.kaEnabled;
+    view.kaIntervalDays = s_config.kaIntervalDays;
+    view.kaLastTime = s_config.kaLastTime;
+    view.tzOffsetMin = s_config.tzOffsetMin;
+    view.rebootEnabled = s_config.rebootEnabled;
+    view.rebootHour = s_config.rebootHour;
+    view.hbEnabled = s_config.hbEnabled;
+    view.hbHour = s_config.hbHour;
+    view.emailEnabled = s_config.emailEnabled;
+    for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) view.schedTasks[i] = s_config.schedTasks[i];
+    xSemaphoreGive(s_config_mutex);
+    return view;
+}
+
+bool idf_config_get_push_channel(uint8_t channel, IdfPushChannel& out)
+{
+    if (channel >= IDF_MAX_PUSH_CHANNELS) return false;
+    if (ensure_config_mutex() != ESP_OK) return false;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    out = s_config.pushChannels[channel];
+    xSemaphoreGive(s_config_mutex);
+    return true;
+}
+
 // 以下布尔/小字段访问器都在锁内直接求值：全量快照要深拷贝 42 个 std::string，
 // 在每个 HTTP 请求上都做一次会造成持续的堆分配抖动与碎片化
 bool idf_config_has_sta_credentials(void)
@@ -739,6 +1472,36 @@ bool idf_config_has_sta_credentials(void)
     bool ok = !s_config.wifiSsid.empty();
     xSemaphoreGive(s_config_mutex);
     return ok;
+}
+
+bool idf_config_net_led_enabled(void)
+{
+    if (ensure_config_mutex() != ESP_OK) return true;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    bool on = s_config.netLedEnabled;
+    xSemaphoreGive(s_config_mutex);
+    return on;
+}
+
+// 时区/NTP 窄访问器：SNTP 同步回调跑在 tiT(lwip) 任务、事件回调跑在系统事件任务，
+// 两者栈都很小(约 3.5KB / 4KB)。全量 idf_config_get() 会把含多个定时任务的大 IdfConfig
+// 深拷贝上这些小栈——任务数上调后直接爆栈(Stack protection fault)。这里只锁内取所需字段。
+int idf_config_get_tz_offset(void)
+{
+    if (ensure_config_mutex() != ESP_OK) return 480;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    int tz = s_config.tzOffsetMin;
+    xSemaphoreGive(s_config_mutex);
+    return tz;
+}
+
+std::string idf_config_get_ntp_server(void)
+{
+    if (ensure_config_mutex() != ESP_OK) return std::string();
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    std::string server = s_config.ntpServer;
+    xSemaphoreGive(s_config_mutex);
+    return server;
 }
 
 bool idf_config_email_configured(void)
