@@ -25,9 +25,11 @@
 static const char* TAG = "idf_modem";
 
 static constexpr uart_port_t MODEM_UART = UART_NUM_1;
-static constexpr gpio_num_t MODEM_TXD = GPIO_NUM_3;
-static constexpr gpio_num_t MODEM_RXD = GPIO_NUM_4;
-static constexpr gpio_num_t MODEM_EN = GPIO_NUM_5;
+// ESP32-D0WDQ6 / classic ESP32 hardware profile:
+// GPIO17 -> ML307 RXD, GPIO16 <- ML307 TXD, GPIO27 -> ML307 EN.
+static constexpr gpio_num_t MODEM_TXD = GPIO_NUM_17;
+static constexpr gpio_num_t MODEM_RXD = GPIO_NUM_16;
+static constexpr gpio_num_t MODEM_EN = GPIO_NUM_27;
 static constexpr int MODEM_BAUD = 115200;
 static constexpr int UART_RX_BUF = 4096;
 static constexpr int MODEM_POWERDOWN_MS = 1200;

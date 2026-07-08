@@ -1,8 +1,8 @@
-# ESP32-C3 native ESP-IDF defaults for the SMS forwarder port.
+# ESP32-D0WDQ6 / classic ESP32 native ESP-IDF defaults for the SMS forwarder port.
 # Keep generated sdkconfig under build/ by invoking idf.py with:
-#   idf.py -B build/idf -D "SDKCONFIG=build/sdkconfig" set-target esp32c3 build
+#   idf.py -B build/idf -D "SDKCONFIG=build/sdkconfig" set-target esp32 build
 
-CONFIG_IDF_TARGET="esp32c3"
+CONFIG_IDF_TARGET="esp32"
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_ota_1m6.csv"

@@ -12,7 +12,9 @@
 #include <stdlib.h>
 #include <new>
 
+#if SOC_TEMP_SENSOR_SUPPORTED
 #include "driver/temperature_sensor.h"
+#endif
 #include "esp_core_dump.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
@@ -155,6 +157,7 @@ static std::string format_epoch_local(uint32_t epoch, int tz_offset_min)
 // 芯片内部温度(概览页显示)；驱动懒加载，失败只记一次不再重试
 static bool read_chip_temp(float& out)
 {
+#if SOC_TEMP_SENSOR_SUPPORTED
     static temperature_sensor_handle_t s_tsens = nullptr;
     static bool s_tsens_failed = false;
     if (!s_tsens && !s_tsens_failed) {
@@ -166,6 +169,10 @@ static bool read_chip_temp(float& out)
         }
     }
     return s_tsens && temperature_sensor_get_celsius(s_tsens, &out) == ESP_OK;
+#else
+    (void)out;
+    return false;
+#endif
 }
 
 static bool auth_matches_config(const char* auth)

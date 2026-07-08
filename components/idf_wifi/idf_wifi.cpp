@@ -33,7 +33,7 @@ static constexpr EventBits_t WIFI_CONNECTED_BIT = BIT0;
 static constexpr EventBits_t WIFI_FAIL_BIT = BIT1;
 static constexpr int WIFI_CONNECT_TIMEOUT_MS = 20000;
 static constexpr const char* AP_SSID_PREFIX = "SMS-Forwarder-";
-static constexpr gpio_num_t PROVISION_BUTTON_PIN = GPIO_NUM_9;
+static constexpr gpio_num_t PROVISION_BUTTON_PIN = GPIO_NUM_32;
 static constexpr uint32_t PROVISION_BUTTON_HOLD_MS = 5000;
 static constexpr uint16_t WIFI_SCAN_RECORD_LIMIT = 40;
 
@@ -181,7 +181,7 @@ static void start_sntp_once()
     // (需要 CONFIG_LWIP_SNTP_MAX_SERVERS>=3，见 sdkconfig.defaults)
     esp_sntp_setservername(1, "ntp.ntsc.ac.cn");
     esp_sntp_setservername(2, "pool.ntp.org");
-    // ESP32-C3 晶振日漂移在秒级，调度粒度是"天"——每 24h 校一次足够，默认 1h 太频繁
+    // 经典 ESP32 晶振日漂移在秒级，调度粒度是"天"——每 24h 校一次足够，默认 1h 太频繁
     esp_sntp_set_sync_interval(24 * 3600 * 1000);
     esp_sntp_init();
     idf_logf("NTP 时间同步已启动：首选=%s，备用=ntp.ntsc.ac.cn,pool.ntp.org", s_ntp_server);

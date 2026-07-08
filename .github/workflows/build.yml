@@ -53,8 +53,8 @@ jobs:
           # OTA 升级包：网页"固件升级"直接上传这个（仅 app 分区镜像）
           cp build/idf/sms_forwarding_idf.bin "dist/sms_forwarder_ota_v${V}.bin"
           # 整机烧录包：bootloader+分区表+app 合并为单文件，esptool 从 0x0 烧录即可
-          esptool.py --chip esp32c3 merge_bin -o "dist/sms_forwarder_full_v${V}.bin" \
-            0x0 build/idf/bootloader/bootloader.bin \
+          esptool.py --chip esp32 merge_bin -o "dist/sms_forwarder_esp32_full_v${V}.bin" \
+            0x1000 build/idf/bootloader/bootloader.bin \
             0x8000 build/idf/partition_table/partition-table.bin \
             0x10000 build/idf/sms_forwarding_idf.bin
           ls -l dist/
@@ -85,4 +85,4 @@ jobs:
             | 文件 | 用途 |
             | --- | --- |
             | `sms_forwarder_ota_v${{ steps.version.outputs.version }}.bin` | 网页「固件升级」页直接上传（OTA，无需数据线） |
-            | `sms_forwarder_full_v${{ steps.version.outputs.version }}.bin` | 整机烧录：`esptool.py --chip esp32c3 write_flash 0x0 <文件>` |
+            | `sms_forwarder_esp32_full_v${{ steps.version.outputs.version }}.bin` | 整机烧录：`esptool.py --chip esp32 write_flash 0x0 <文件>` |
