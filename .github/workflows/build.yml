@@ -13,6 +13,12 @@ on:
       - '.github/workflows/build.yml'
   pull_request:
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: '构建完成后发布/更新 GitHub Release'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write  # 发布 Release 需要
@@ -70,10 +76,13 @@ jobs:
             build/idf/partition_table/partition-table.bin
           retention-days: 7
 
-      # 推送到 master 时自动发布/更新 Release：tag 为 v<版本号>，附可直接下载的固件。
-      # 同版本再次推送会更新既有 Release 的附件（覆盖同名文件），不会重复建 Release。
+      # 推送到 master 时自动发布/更新 Release；
+      # 或者手动运行 workflow 时勾选 publish_release=true 也会发布/更新 Release。
+      # tag 为 v<版本号>，同版本再次发布会更新既有 Release 的附件（覆盖同名文件），不会重复建 Release。
       - name: Publish GitHub Release
-        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        if: |
+          (github.event_name == 'push' && github.ref == 'refs/heads/master') ||
+          (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.version.outputs.version }}
