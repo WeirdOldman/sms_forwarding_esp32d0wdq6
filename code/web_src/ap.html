@@ -45,6 +45,7 @@ button.sec{background:#e3e6ea;color:#1a1d21;width:auto;margin:0;padding:9px 14px
 </div>
 <script>
 function $(i){return document.getElementById(i)}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 function show(cls,html){var m=$('msg');m.className='msg show '+cls;m.innerHTML=html}
 function scan(){
 var b=$('scanBtn');b.disabled=true;b.textContent='扫描中';
@@ -65,8 +66,8 @@ if(!ssid){show('err','请输入 WiFi 名称');return}
 var b=$('saveBtn');b.disabled=true;b.textContent='连接中…';
 var body='ssid='+encodeURIComponent(ssid)+'&pass='+encodeURIComponent($('pass').value);
 fetch('/wificonfig',{method:'POST',cache:'no-store',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body}).then(function(r){return r.json()}).then(function(d){
-if(!d.success){show('err',d.message||'配置无效');b.disabled=false;b.textContent='保存并连接';return}
-show('info','已保存，正在连接 <b>'+(ssid.replace(/</g,'&lt;'))+'</b> …<br>切换信道时本页可能短暂断开，会自动恢复，请稍候。');
+if(!d.success){show('err',esc(d.message||'配置无效'));b.disabled=false;b.textContent='保存并连接';return}
+show('info','已保存，正在连接 <b>'+esc(ssid)+'</b> …<br>切换信道时本页可能短暂断开，会自动恢复，请稍候。');
 startPoll();
 }).catch(function(){show('info','已提交，正在连接…请稍候。');startPoll()});
 }
