@@ -48,6 +48,7 @@
       background-image: linear-gradient(var(--grid) 1px, transparent 1px), linear-gradient(90deg, var(--grid) 1px, transparent 1px);
       background-size: 28px 28px;
       display: flex; min-height: 100vh; -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;   /* 兜底：离屏抽屉(translateX)/个别宽元素不再让整页横向滚动 */
     }
 
     /* Sidebar */
@@ -378,7 +379,7 @@
       .sidebar-footer { padding: 8px; }
       .sidebar-footer .btn span { display: none; }
       .sidebar-footer .btn { padding: 6px; font-size: 11px; }
-      .main { margin-left: 50px; padding: 18px 14px; }
+      .main { margin-left: 50px; padding: 18px 14px; min-width: 0; }
       :root { --sidebar-w: 50px; }
       .card-grid { column-count: 1; }
       /* 窄屏卡片头允许换行；收发短信页搜索框独占一行，不再和 tab/按钮挤在一起 */
@@ -390,14 +391,24 @@
       .sim-grid { display: grid; grid-template-columns: 1fr; }
       .esim-status-line, .esim-actions { grid-template-columns: 1fr; }
       .schedule-grid { grid-template-columns: 1fr; }
-      .schedule-grid .form-row { flex-direction: column; gap: 10px; }
+      /* 窄屏统一：所有并排字段(SMTP 服务器/端口、周期/动作、任务名/周期…)改为竖排，
+         并给 flex 子项 min-width:0，避免两个输入框把整页撑出横向滚动 */
+      .form-row { flex-direction: column; gap: 10px; }
+      .form-row .form-group { min-width: 0; }
+      /* 通道/任务卡头允许换行：倒计时日期、通道摘要不再挤出屏幕，放不下自动落到下一行 */
+      .push-channel-header { flex-wrap: wrap; row-gap: 6px; }
+      .push-channel-header .label-inline { min-width: 0; }
+      .ch-summary { max-width: 100%; }
+      .schedule-tag { max-width: 100%; white-space: normal; }
+      /* 输入条(诊断/AT/规则测试)允许换行，窄屏下按钮落到输入框下方 */
+      .at-bar { flex-wrap: wrap; }
+      .at-bar .form-input { min-width: 0; flex: 1 1 100%; }
       .schedule-actions .btn-row .btn { min-width: 0; }
       .bark-param-grid { grid-template-columns: 1fr; }
       .page-head { flex-wrap: wrap; }
       .page-action { width: 100%; }
       #panel-keepalive form { max-width: none; }
       #panel-keepalive .sched-task-grid { grid-template-columns: 1fr; }
-      #panel-keepalive .push-channel-body .form-row { flex-direction: column; gap: 10px; }
     }
     /* 保存提示 toast（AJAX 原地保存，不跳页） */
     .save-toast{position:fixed;right:20px;top:20px;z-index:9999;padding:11px 18px;border-radius:8px;font-size:13px;font-weight:600;color:#fff;box-shadow:0 4px 16px rgba(0,0,0,.25);opacity:0;transform:translateY(-8px);transition:opacity .25s,transform .25s;pointer-events:none;}

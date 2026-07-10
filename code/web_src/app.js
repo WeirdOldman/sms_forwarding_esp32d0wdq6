@@ -842,7 +842,7 @@
         if (!cd) return;
         if (!d.timeValid) cd.textContent = '时间未同步，倒计时暂不可用';
         else if (!d.lastTime) cd.textContent = '尚未建立基准日，启用后首次检查时建立';
-        else cd.textContent = '上次 ' + (d.lastTimeLocal || '--') + ' · 约 ' + d.daysLeft + ' 天后';
+        else cd.textContent = '上次 ' + (d.lastTimeLocal || '--').slice(0, 10) + ' · 约 ' + d.daysLeft + ' 天后';
       }).catch(function(){});
     }
     // 保号卡：启用态高亮 + kaForm 安全 arm（与自定义任务 st* 同一套保护）
