@@ -38,8 +38,7 @@ static constexpr int MODEM_POWERUP_MAX_MS = 6000;
 static constexpr uint32_t CELLULAR_KEEPALIVE_MIN_BYTES = 48UL * 1024UL;
 static constexpr uint32_t CELLULAR_HTTP_TIMEOUT_MS = 90000UL;
 static constexpr uint32_t CELLULAR_PDP_READY_TIMEOUT_MS = 12000UL;
-static constexpr uint32_t MODEM_DATA_MODE_RETRY_GAP_MS = 10000UL;
-static constexpr uint8_t MODEM_DATA_MODE_RETRY_MAX = 3;
+static constexpr uint32_t MODEM_SIM_CONFIG_RETRY_GAP_MS = 10000UL;
 static constexpr uint32_t IDENTITY_RETRY_INTERVAL_MS = 600000UL;
 // 用户显式刷新概览模组信息后才做展示型采样：启动期不主动读取身份/信号；
 // 采样仍受 at_channel_idle 门控，不与收发/保号抢 AT 通道
@@ -60,9 +59,12 @@ static IdfModemStatus s_status;
 static std::string s_urc_buffer;
 static bool s_started = false;
 static std::atomic<int> s_reset_request{0};  // 1=AT软重启，2=EN硬重启；由模组任务执行
-static bool s_data_mode_retry_pending = false;
-static uint8_t s_data_mode_retry_count = 0;
-static TickType_t s_next_data_mode_retry = 0;
+static constexpr uint32_t SIM_APPLY_OPERATOR = 1u << 0;
+static constexpr uint32_t SIM_APPLY_DATA = 1u << 1;
+static std::atomic<uint32_t> s_sim_config_apply_pending{0};
+static std::atomic<bool> s_sim_config_apply_urgent{false};
+static TickType_t s_next_sim_config_apply = 0;
+static uint32_t s_sim_config_apply_failures = 0;
 static int s_logged_csq = -1;
 static int s_logged_ber = -1;
 static int s_logged_rsrp = 999;
@@ -798,9 +800,13 @@ static bool parse_http_url(const std::string& raw_url, std::string& protocol,
     size_t hash = path.find('#');
     if (hash != std::string::npos) path.resize(hash);
     host = trim(host);
-    if (host.empty() || host.find('"') != std::string::npos ||
-        host.find(' ') != std::string::npos || path.find('"') != std::string::npos ||
-        path.find(' ') != std::string::npos) {
+    auto has_forbidden_at_char = [](const std::string& value) {
+        for (unsigned char ch : value) {
+            if (ch <= 0x20 || ch == 0x7F || ch == '"') return true;
+        }
+        return false;
+    };
+    if (host.empty() || has_forbidden_at_char(host) || has_forbidden_at_char(path)) {
         error = "蜂窝HTTP URL包含非法字符";
         return false;
     }
@@ -1227,21 +1233,23 @@ static bool apply_configured_data_mode_once(const IdfSimSettingsView& cfg, uint3
     std::string resp;
     std::string apn = trim(cfg.apn);
     // 数据漫游策略：未勾选"允许数据漫游"且当前处于漫游(CEREG=5)时不激活蜂窝数据。
-    // 启动阶段注册状态未知(stat=-1)会乐观激活，注册完成后由 enforce_roaming_data_policy 兜底关闭。
+    // 启动阶段注册状态未知时先按配置下发，注册完成后收敛任务会再次确认真实状态。
     bool want_data = cfg.dataEnabled &&
                      (cfg.roamingEnabled || idf_modem_get_status().ceregStat != 5);
     if (want_data) {
+        bool apn_ok = true;
         if (!apn.empty() && apn_valid_for_at(apn)) {
             std::string cmd = "AT+CGDCONT=1,\"IP\",\"";
             cmd += apn;
             cmd += "\"";
-            send_ok(cmd.c_str(), 3000, &resp);
+            apn_ok = send_ok(cmd.c_str(), 3000, &resp);
         } else if (!apn.empty()) {
             idf_log_line("APN 包含非法字符，启动时未下发 CGDCONT");
+            apn_ok = false;
         }
+        if (!apn_ok) return false;
         bool ok = send_ok("AT+CGACT=1,1", active_timeout_ms, &resp);
-        if (ok) sample_cell_ip_once();
-        return ok;
+        return ok && sample_cell_ip_once();
     }
 
     bool ok = send_ok("AT+CGACT=0,1", inactive_timeout_ms, &resp);
@@ -1249,26 +1257,12 @@ static bool apply_configured_data_mode_once(const IdfSimSettingsView& cfg, uint3
     return ok;
 }
 
-// 数据漫游策略兜底：未勾选"允许数据漫游"且当前漫游(stat=5)时确保蜂窝数据关闭。
-// 启动阶段拿不到注册状态会先乐观激活，注册完成后在此关闭，避免漫游误跑流量。
-// 短信不受影响(走 CS/IMS 信令域)。归属网络(stat=1)不干预，按常规激活。
-static void enforce_roaming_data_policy(const IdfSimSettingsView& cfg, int stat)
+static void request_sim_config_apply(uint32_t flags)
 {
-    if (!cfg.dataEnabled || cfg.roamingEnabled) return;  // 未开数据或允许漫游数据：无需干预
-    if (stat != 5) return;                                // 非漫游：归属网络按常规激活即可
-    if (idf_modem_get_status().cellIp.empty()) return;    // 数据本就未激活，无需再关
-    std::string resp;
-    if (send_ok("AT+CGACT=0,1", 3000, &resp)) {
-        set_status_cell_ip("");
-        idf_log_line("数据漫游已关闭：检测到漫游，已停用蜂窝数据(不跑流量)");
-    }
-}
-
-static void schedule_data_mode_retry(void)
-{
-    s_data_mode_retry_pending = true;
-    s_data_mode_retry_count = 0;
-    s_next_data_mode_retry = xTaskGetTickCount() + pdMS_TO_TICKS(MODEM_DATA_MODE_RETRY_GAP_MS);
+    if (flags == 0) return;
+    s_sim_config_apply_pending.fetch_or(flags, std::memory_order_relaxed);
+    s_sim_config_apply_urgent.store(true, std::memory_order_relaxed);
+    idf_modem_signal_event();
 }
 
 static void apply_startup_data_mode(void)
@@ -1280,13 +1274,14 @@ static void apply_startup_data_mode(void)
     IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
     bool ok = apply_configured_data_mode_once(cfg, 6000, 2500);
     if (ok) {
-        idf_log_line(cfg.dataEnabled ? "已按配置启用蜂窝数据(AT+CGACT=1,1)"
-                                     : "已禁用数据连接(AT+CGACT=0,1)，防止流量消耗");
+        idf_log_line(cfg.dataEnabled ? "启动阶段已下发蜂窝数据配置，注册后将再次确认"
+                                     : "启动阶段已下发数据禁用配置，注册后将再次确认");
     } else {
-        idf_log_line(cfg.dataEnabled ? "启动时激活数据连接未成功，转入后台重试"
-                                     : "启动时禁用数据连接未确认，转入后台重试");
-        schedule_data_mode_retry();
+        idf_log_line(cfg.dataEnabled ? "启动时激活数据连接未成功，保留后台收敛请求"
+                                     : "启动时禁用数据连接未确认，保留后台收敛请求");
     }
+    // 注册过程可能改变 PDP 状态；无论启动阶段是否成功，注册后都必须再次核对。
+    request_sim_config_apply(SIM_APPLY_DATA);
 }
 
 static bool plmn_valid(const std::string& plmn)
@@ -1299,42 +1294,81 @@ static bool plmn_valid(const std::string& plmn)
     return true;
 }
 
-static void apply_operator_if_configured(const IdfSimSettingsView& cfg)
+static bool apply_configured_operator_once(const IdfSimSettingsView& cfg)
 {
-    if (cfg.operatorPlmn.empty()) return;
     if (!plmn_valid(cfg.operatorPlmn)) {
-        idf_log_line("运营商 PLMN 非法，启动时未下发 COPS");
-        return;
+        idf_log_line("运营商 PLMN 非法，未下发 COPS");
+        return false;
     }
-    std::string cmd = "AT+COPS=1,2,\"";
-    cmd += cfg.operatorPlmn;
-    cmd += "\"";
+    std::string cmd = cfg.operatorPlmn.empty() ? "AT+COPS=0" : "AT+COPS=1,2,\"" + cfg.operatorPlmn + "\"";
     std::string resp;
     esp_err_t err = idf_modem_send_at(cmd, 30000, resp);
-    idf_logf("运营商: 锁定 PLMN %s %s", cfg.operatorPlmn.c_str(),
-             err == ESP_OK ? "成功" : "失败(可能不可达)");
+    if (cfg.operatorPlmn.empty()) {
+        idf_logf("运营商: 自动注册(COPS=0) %s", err == ESP_OK ? "成功" : "失败");
+    } else {
+        idf_logf("运营商: 锁定 PLMN %s %s", cfg.operatorPlmn.c_str(),
+                 err == ESP_OK ? "成功" : "失败(可能不可达)");
+    }
+    return err == ESP_OK;
 }
 
-static bool process_data_mode_retry(void)
+static bool same_data_settings(const IdfSimSettingsView& a, const IdfSimSettingsView& b)
 {
-    if (!s_data_mode_retry_pending) return false;
-    if (static_cast<int32_t>(xTaskGetTickCount() - s_next_data_mode_retry) < 0) return false;  // 回绕安全
+    return a.dataEnabled == b.dataEnabled && a.roamingEnabled == b.roamingEnabled && a.apn == b.apn;
+}
+
+static bool process_sim_config_apply(void)
+{
+    uint32_t pending = s_sim_config_apply_pending.load(std::memory_order_relaxed);
+    if (pending == 0) return false;
+    TickType_t now = xTaskGetTickCount();
+    if (s_sim_config_apply_urgent.exchange(false, std::memory_order_relaxed)) {
+        s_next_sim_config_apply = now;
+    }
+    if (static_cast<int32_t>(now - s_next_sim_config_apply) < 0) return false;
     if (!at_channel_idle_now()) return false;
 
-    ++s_data_mode_retry_count;
     IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
-    bool ok = apply_configured_data_mode_once(cfg, 8000, 3000);
-    if (ok) {
-        s_data_mode_retry_pending = false;
-        idf_log_line(cfg.dataEnabled ? "后台重试：蜂窝数据已启用" : "后台重试：蜂窝数据已禁用");
-    } else if (s_data_mode_retry_count >= MODEM_DATA_MODE_RETRY_MAX) {
-        s_data_mode_retry_pending = false;
-        idf_log_line("后台重试 CGACT 仍失败，保留当前模组状态");
-    } else {
-        s_next_data_mode_retry = xTaskGetTickCount() + pdMS_TO_TICKS(MODEM_DATA_MODE_RETRY_GAP_MS);
-        idf_log_line("后台重试 CGACT 未成功，稍后再试");
+    IdfModemStatus modem = idf_modem_get_status();
+    uint32_t succeeded = 0;
+    bool attempted = false;
+
+    if (pending & SIM_APPLY_OPERATOR) {
+        attempted = true;
+        if (apply_configured_operator_once(cfg)) {
+            IdfSimSettingsView latest = idf_config_get_sim_settings_view();
+            if (latest.operatorPlmn == cfg.operatorPlmn) succeeded |= SIM_APPLY_OPERATOR;
+        }
     }
-    return true;
+    if (pending & SIM_APPLY_DATA) {
+        // 启用数据必须等网络注册；禁用数据则应尽早下发，并在注册后再次触发确认。
+        if (!cfg.dataEnabled || modem.modemReady) {
+            attempted = true;
+            if (model_skips_cgact() || apply_configured_data_mode_once(cfg, 10000, 5000)) {
+                IdfSimSettingsView latest = idf_config_get_sim_settings_view();
+                if (same_data_settings(latest, cfg)) succeeded |= SIM_APPLY_DATA;
+            }
+        }
+    }
+
+    if (succeeded != 0) {
+        s_sim_config_apply_pending.fetch_and(~succeeded, std::memory_order_relaxed);
+    }
+    uint32_t remaining = s_sim_config_apply_pending.load(std::memory_order_relaxed);
+    if (remaining == 0) {
+        s_sim_config_apply_failures = 0;
+        idf_log_line("蜂窝设置已与模组运行状态一致");
+    } else {
+        s_next_sim_config_apply = now + pdMS_TO_TICKS(MODEM_SIM_CONFIG_RETRY_GAP_MS);
+        if (attempted) {
+            ++s_sim_config_apply_failures;
+            if (s_sim_config_apply_failures == 1 || (s_sim_config_apply_failures % 6) == 0) {
+                idf_logf("蜂窝设置尚未完全生效，后台将继续重试(第%u次)",
+                         static_cast<unsigned>(s_sim_config_apply_failures));
+            }
+        }
+    }
+    return attempted;
 }
 
 static bool fetch_mhttp_once_locked(const std::string& protocol, const std::string& host,
@@ -1466,11 +1500,8 @@ esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularH
 
     bool ok = fetch_mhttp_once_locked(protocol, host, path, result);
     if (!ok && protocol == "https" && result.mhttpError == 4) {
-        idf_log_line("HTTPS握手失败，改用HTTP重试一次；若返回301，请关闭强制HTTPS跳转");
-        IdfCellularHttpResult retry;
-        retry.cellIp = result.cellIp;
-        ok = fetch_mhttp_once_locked("http", host, path, retry);
-        result = retry;
+        result.message = "HTTPS 握手失败，已保持 HTTPS 且未降级为明文 HTTP";
+        idf_log_line("HTTPS握手失败，已拒绝降级为HTTP");
     }
 
     if (!config.dataEnabled) {
@@ -1849,6 +1880,7 @@ static void handle_reset_request_if_any(void)
     configure_sms_and_registration();
     set_phase("registering");
     apply_startup_data_mode();
+    request_sim_config_apply(SIM_APPLY_OPERATOR | SIM_APPLY_DATA);
     s_reinit_pending = false;
 }
 
@@ -1868,6 +1900,7 @@ static void run_pending_reinit_if_recovered(void)
     configure_sms_and_registration();
     set_phase("registering");
     apply_startup_data_mode();
+    request_sim_config_apply(SIM_APPLY_OPERATOR | SIM_APPLY_DATA);
     s_reinit_pending = false;
 }
 
@@ -1933,6 +1966,11 @@ static void modem_task(void*)
 
     set_phase("registering");
     apply_startup_data_mode();
+    IdfSimSettingsView startup_cfg = idf_config_get_sim_settings_view();
+    if (!startup_cfg.operatorPlmn.empty()) {
+        request_sim_config_apply(SIM_APPLY_OPERATOR);
+        process_sim_config_apply();
+    }
 
     int check_count = 0;
     int stat = -1;
@@ -1954,10 +1992,8 @@ static void modem_task(void*)
         set_phase("failed");
     } else {
         retry_sms_storage_if_pending();
-        IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
-        apply_operator_if_configured(cfg);
-        if (cfg.dataEnabled) sample_cell_ip_once();
-        enforce_roaming_data_policy(cfg, stat);
+        request_sim_config_apply(SIM_APPLY_DATA);
+        process_sim_config_apply();
         // 注册成功后立即做一轮首页基础信息采样；Web/WiFi 已先启动，不会阻塞页面打开。
         sample_signal_once();
         sample_signal_detail_once();
@@ -1978,7 +2014,7 @@ static void modem_task(void*)
         handle_reset_request_if_any();
         run_pending_reinit_if_recovered();
         TickType_t now = xTaskGetTickCount();
-        if (process_data_mode_retry()) {
+        if (process_sim_config_apply()) {
             vTaskDelay(pdMS_TO_TICKS(200));
             continue;
         }
@@ -2034,10 +2070,8 @@ static void modem_task(void*)
                         // 掉网后恢复可能意味着模组自发复位过：存储选择无条件重跑，
                         // 不能只看 pending 标志(初次成功后它恒为 false)
                         s_sms_storage_pending = !select_sms_storage();
-                        IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
-                        apply_operator_if_configured(cfg);
-                        if (cfg.dataEnabled) sample_cell_ip_once();
-                        enforce_roaming_data_policy(cfg, stat);
+                        request_sim_config_apply(SIM_APPLY_DATA);
+                        process_sim_config_apply();
                         sample_signal_once();
                         sample_signal_detail_once();
                         sample_identity_once(false, true);
@@ -2077,6 +2111,7 @@ static void modem_task(void*)
                     idf_log_line("检测到 SIM 卡插入，重新初始化模组");
                     configure_sms_and_registration();
                     idf_modem_invalidate_sim_identity();
+                    request_sim_config_apply(SIM_APPLY_OPERATOR | SIM_APPLY_DATA);
                     registered = false;
                     post_register_done = false;
                     dereg_count = 0;
@@ -2198,6 +2233,14 @@ esp_err_t idf_modem_request_reset(bool hard_reset)
     return ESP_OK;
 }
 
+void idf_modem_request_sim_config_apply(bool operator_changed, bool data_changed)
+{
+    uint32_t flags = 0;
+    if (operator_changed) flags |= SIM_APPLY_OPERATOR;
+    if (data_changed) flags |= SIM_APPLY_DATA;
+    request_sim_config_apply(flags);
+}
+
 bool idf_modem_at_idle(void)
 {
     return at_channel_idle_now();
@@ -2232,6 +2275,7 @@ void idf_modem_invalidate_sim_identity(void)
     // 复位采样"已尝试"标志，让网络字段(运营商/号码)重新查询；静态字段(型号/IMEI)非空仍跳过
     reset_identity_sampling_state();
     idf_modem_request_status_sample();
+    request_sim_config_apply(SIM_APPLY_DATA);
     // 通知上层(idf_esim)：热插拔换卡后 EID 等缓存也要失效
     void (*hook)(void) = s_sim_identity_hook.load(std::memory_order_relaxed);
     if (hook) hook();

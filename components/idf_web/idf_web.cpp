@@ -67,7 +67,6 @@ static WebAsyncJob s_esim_job;
 static WebAsyncJob s_sched_job;
 static int s_sched_job_index = -1;
 static EsimWebCache s_esim_cache;
-static bool s_modem_apply_running = false;
 static bool s_web_modem_action_running = false;
 
 static bool cell_job_lock(TickType_t ticks = pdMS_TO_TICKS(300));
@@ -1144,113 +1143,6 @@ static esp_err_t handle_ussd(httpd_req_t* req)
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
-static bool plmn_valid(const std::string& plmn)
-{
-    if (plmn.empty()) return true;
-    if (plmn.size() < 5 || plmn.size() > 6) return false;
-    for (char ch : plmn) {
-        if (!isdigit(static_cast<unsigned char>(ch))) return false;
-    }
-    return true;
-}
-
-static bool apn_valid_for_at(const std::string& apn)
-{
-    return apn.size() <= 96 && apn.find('"') == std::string::npos &&
-           apn.find('\r') == std::string::npos && apn.find('\n') == std::string::npos;
-}
-
-struct ModemApplyTaskArg {
-    bool dataChanged = false;
-    bool operatorChanged = false;
-    bool dataEnabled = false;
-    bool roamingEnabled = true;
-    std::string apn;
-    std::string operatorPlmn;
-};
-
-static void modem_apply_task(void* raw)
-{
-    ModemApplyTaskArg* arg = static_cast<ModemApplyTaskArg*>(raw);
-    bool data_changed = arg->dataChanged;
-    bool operator_changed = arg->operatorChanged;
-    bool data_enabled = arg->dataEnabled;
-    bool roaming_enabled = arg->roamingEnabled;
-    std::string apn = std::move(arg->apn);
-    std::string operator_plmn = std::move(arg->operatorPlmn);
-    delete arg;
-
-    bool claimed = false;
-    if (cell_job_lock()) {
-        if (cellular_job_active_locked()) {
-            cell_job_unlock();
-            idf_log_line("SIM 设置已保存，蜂窝/eSIM 任务正忙，暂不立即下发 COPS/CGACT");
-            vTaskDelete(nullptr);
-            return;
-        }
-        s_modem_apply_running = true;
-        claimed = true;
-        cell_job_unlock();
-    } else {
-        idf_log_line("SIM 设置已保存，蜂窝任务状态锁忙，暂不立即下发 COPS/CGACT");
-        vTaskDelete(nullptr);
-        return;
-    }
-
-    auto finish = [&]() {
-        if (claimed && cell_job_lock(portMAX_DELAY)) {
-            s_modem_apply_running = false;
-            cell_job_unlock();
-        }
-        vTaskDelete(nullptr);
-    };
-
-    IdfModemStatus modem = idf_modem_get_status();
-    if (!modem.modemReady) {
-        idf_log_line("SIM 设置已保存，模组未注册，暂不下发 COPS/CGACT");
-        finish();
-        return;
-    }
-
-    std::string resp;
-    if (operator_changed) {
-        if (!plmn_valid(operator_plmn)) {
-            idf_log_line("运营商 PLMN 非法，未下发 COPS");
-        } else if (operator_plmn.empty()) {
-            idf_modem_send_at("AT+COPS=0", 30000, resp);
-            idf_log_line("运营商: 自动注册(COPS=0)");
-        } else {
-            std::string cmd = "AT+COPS=1,2,\"" + operator_plmn + "\"";
-            esp_err_t err = idf_modem_send_at(cmd, 30000, resp);
-            idf_logf("运营商: 锁定 PLMN %s %s", operator_plmn.c_str(),
-                     err == ESP_OK ? "成功" : "失败(可能不可达)");
-        }
-    }
-
-    if (data_changed) {
-        if (data_enabled && !roaming_enabled && modem.ceregStat == 5) {
-            // 数据漫游关闭且当前漫游：不激活蜂窝数据(短信仍走 CS/IMS 不受影响)
-            idf_modem_send_at("AT+CGACT=0,1", 5000, resp);
-            idf_log_line("数据漫游已关闭：当前处于漫游，未激活蜂窝数据(不跑流量)");
-        } else if (data_enabled) {
-            if (!apn.empty() && apn_valid_for_at(apn)) {
-                std::string cmd = "AT+CGDCONT=1,\"IP\",\"" + apn + "\"";
-                idf_modem_send_at(cmd, 3000, resp);
-            } else if (!apn.empty()) {
-                idf_log_line("APN 包含非法字符，未下发 CGDCONT");
-            }
-            idf_modem_send_at("AT+CGACT=1,1", 10000, resp);
-            std::string ip_resp;
-            idf_modem_send_at("AT+CGPADDR=1", 3000, ip_resp);
-            idf_logf("蜂窝数据已启用(APN=%s)", apn.empty() ? "自动" : apn.c_str());
-        } else {
-            idf_modem_send_at("AT+CGACT=0,1", 5000, resp);
-            idf_log_line("蜂窝数据已禁用(零流量)");
-        }
-    }
-    finish();
-}
-
 static void preserve_redacted_push_key(const IdfFormFields& fields,
                                        const IdfPushChannel& previous,
                                        int index,
@@ -1541,21 +1433,8 @@ static esp_err_t handle_save(httpd_req_t* req)
         idf_log_line("网页保存蜂窝设置");
         if (!data_changed && !operator_changed) return ESP_OK;
 
-        ModemApplyTaskArg* arg = new (std::nothrow) ModemApplyTaskArg();
-        if (arg) {
-            arg->dataChanged = data_changed;
-            arg->operatorChanged = operator_changed;
-            arg->dataEnabled = after.dataEnabled;
-            arg->roamingEnabled = after.roamingEnabled;  // 不带上它，漫游关闭的立即生效保护永远不触发
-            arg->apn = after.apn;
-            arg->operatorPlmn = after.operatorPlmn;
-            if (xTaskCreate(modem_apply_task, "idf_sim_apply", 4096, arg, 3, nullptr) != pdPASS) {
-                delete arg;
-                idf_log_line("SIM 设置已保存，但后台 AT 应用任务创建失败");
-            }
-        } else {
-            idf_log_line("SIM 设置已保存，但后台 AT 应用任务内存不足");
-        }
+        idf_modem_request_sim_config_apply(operator_changed, data_changed);
+        idf_log_line("蜂窝设置已提交模组后台应用；若当前忙或未注册将持续重试");
         return ESP_OK;
     }
 
@@ -1930,7 +1809,8 @@ static esp_err_t handle_send_sms(httpd_req_t* req)
     if (!check_auth(req)) return ESP_OK;
     if (!check_csrf(req)) return ESP_OK;
     std::string raw;
-    if (read_body(req, raw, 2048) != ESP_OK) return ESP_OK;
+    // 300 个四字节字符经 application/x-www-form-urlencoded 膨胀后可超过 3.6KB。
+    if (read_body(req, raw, 8192) != ESP_OK) return ESP_OK;
     IdfFormFields fields = parse_urlencoded(raw);
     const std::string* phone = find_field(fields, "phone");
     const std::string* content = find_field(fields, "content");
@@ -2186,9 +2066,11 @@ static bool keepalive_url_valid(const std::string& raw_url, std::string& err)
         err = "URL需要以 http:// 或 https:// 开头";
         return false;
     }
-    if (url.find('"') != std::string::npos || url.find(' ') != std::string::npos) {
-        err = "URL包含非法字符";
-        return false;
+    for (unsigned char ch : url) {
+        if (ch <= 0x20 || ch == 0x7F || ch == '"') {
+            err = "URL包含非法字符";
+            return false;
+        }
     }
     return true;
 }
@@ -2209,7 +2091,6 @@ static bool cellular_job_active_locked(void)
            s_keepalive_job.running || s_keepalive_job.queued ||
            s_esim_job.running || s_esim_job.queued ||
            s_sched_job.running || s_sched_job.queued ||
-           s_modem_apply_running ||
            s_web_modem_action_running;
 }
 

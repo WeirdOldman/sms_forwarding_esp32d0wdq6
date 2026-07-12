@@ -1136,41 +1136,80 @@ esp_err_t idf_sms_start(void)
 }
 
 // —— 长短信发送辅助 ——
-// 保守判定"纯 GSM7"：仅 ASCII 可打印字符与 \r\n。其余(含中文)按 UCS2 处理。
-// 保守的意义：切分假设 GSM7 但实际落入 UCS2 会导致该段超长编码失败，反之只是少装几个字
-static bool sms_text_basic_gsm7(const std::string& text)
+struct SmsCharUnits {
+    size_t bytes = 0;
+    uint8_t gsm7 = 0;
+    uint8_t ucs2 = 0;
+};
+
+struct SmsTextAnalysis {
+    bool gsm7 = true;
+    std::vector<SmsCharUnits> chars;
+};
+
+static bool gsm7_extension_char(unsigned short codepoint)
 {
-    for (unsigned char c : text) {
-        if (c == '\r' || c == '\n') continue;
-        if (c < 0x20 || c >= 0x7F) return false;
-    }
-    return true;
+    if (codepoint == 0x000C || codepoint == 0x20AC) return true;  // 换页、欧元符号
+    return codepoint <= 0x7F && strchr("^{}\\[~]|", static_cast<char>(codepoint));
 }
 
-// 按每段配额切分，不打断 UTF-8 字符。gsm7 按 septet 计(扩展表字符占 2)，
-// UCS2 按 UTF-16 码元计(BMP 外字符即代理对占 2)
-static std::vector<std::string> sms_split_parts(const std::string& text, bool gsm7, size_t per_part)
+// 直接复用 PDU 库的 UTF-8 与 GSM 03.38 判定，避免分段器和最终编码器各自维护字符表。
+static esp_err_t sms_analyze_text(const std::string& text, SmsTextAnalysis& out)
 {
-    std::vector<std::string> parts;
+    out = SmsTextAnalysis();
+    out.chars.reserve(text.size());
+    if (!s_pdu_mutex || xSemaphoreTake(s_pdu_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
     size_t pos = 0;
     while (pos < text.size()) {
-        size_t units = 0;
-        size_t end = pos;
-        while (end < text.size()) {
-            unsigned char lead = static_cast<unsigned char>(text[end]);
-            size_t clen = (lead >= 0xF0) ? 4 : (lead >= 0xE0) ? 3 : (lead >= 0xC0) ? 2 : 1;
-            if (end + clen > text.size()) clen = text.size() - end;
-            size_t u;
-            if (gsm7) u = (clen == 1 && strchr("[]{}\\^~|", text[end])) ? 2 : 1;
-            else u = (clen == 4) ? 2 : 1;
-            if (units + u > per_part) break;
-            units += u;
-            end += clen;
+        int bytes = s_pdu.utf8Length(text.c_str() + pos);
+        if (bytes <= 0 || pos + static_cast<size_t>(bytes) > text.size()) {
+            xSemaphoreGive(s_pdu_mutex);
+            return ESP_ERR_INVALID_ARG;
         }
-        if (end == pos) break;  // 防御：不应发生(单字符不会超过任何配额)
-        parts.push_back(text.substr(pos, end - pos));
-        pos = end;
+        unsigned short ucs2[2] = {};
+        int ucs2_bytes = s_pdu.utf8_to_ucs2_single(text.c_str() + pos, ucs2);
+        if (ucs2_bytes != 2 && ucs2_bytes != 4) {
+            xSemaphoreGive(s_pdu_mutex);
+            return ESP_ERR_INVALID_ARG;
+        }
+        unsigned short codepoint = static_cast<unsigned short>(
+            (ucs2[0] << 8) | ((ucs2[0] & 0xFF00) >> 8));
+        bool char_gsm7 = s_pdu.isGSM7(&codepoint);
+        SmsCharUnits unit;
+        unit.bytes = static_cast<size_t>(bytes);
+        unit.gsm7 = char_gsm7 ? (gsm7_extension_char(codepoint) ? 2 : 1) : 0;
+        unit.ucs2 = static_cast<uint8_t>(ucs2_bytes / 2);
+        out.gsm7 = out.gsm7 && char_gsm7;
+        out.chars.push_back(unit);
+        pos += unit.bytes;
     }
+    xSemaphoreGive(s_pdu_mutex);
+    return ESP_OK;
+}
+
+// 按每段配额切分，不打断 UTF-8 字符。GSM7 按 septet 计，UCS2 按 UTF-16 码元计。
+static std::vector<std::string> sms_split_parts(const std::string& text,
+                                                const SmsTextAnalysis& analysis,
+                                                size_t per_part)
+{
+    std::vector<std::string> parts;
+    size_t part_start = 0;
+    size_t byte_pos = 0;
+    size_t units = 0;
+    for (const SmsCharUnits& ch : analysis.chars) {
+        size_t next_units = analysis.gsm7 ? ch.gsm7 : ch.ucs2;
+        if (units > 0 && units + next_units > per_part) {
+            parts.push_back(text.substr(part_start, byte_pos - part_start));
+            part_start = byte_pos;
+            units = 0;
+        }
+        units += next_units;
+        byte_pos += ch.bytes;
+    }
+    if (byte_pos > part_start) parts.push_back(text.substr(part_start, byte_pos - part_start));
     return parts;
 }
 
@@ -1201,9 +1240,15 @@ esp_err_t idf_sms_send_text(const std::string& phone_raw, const std::string& tex
     message.clear();
     std::string phone = trim(phone_raw);
     std::string text = trim(text_raw);
-    if (!is_valid_phone_number(phone) || text.empty() || text.size() > 300) {
+    if (!is_valid_phone_number(phone) || text.empty()) {
         message = "号码或内容无效";
         return ESP_ERR_INVALID_ARG;
+    }
+    SmsTextAnalysis analysis;
+    esp_err_t analyze_err = sms_analyze_text(text, analysis);
+    if (analyze_err != ESP_OK || analysis.chars.size() > 300) {
+        message = analyze_err == ESP_ERR_TIMEOUT ? "PDU 编码器忙" : "号码或内容无效";
+        return analyze_err == ESP_OK ? ESP_ERR_INVALID_SIZE : analyze_err;
     }
     IdfModemStatus modem = idf_modem_get_status();
     if (!modem.modemReady) {
@@ -1213,13 +1258,13 @@ esp_err_t idf_sms_send_text(const std::string& phone_raw, const std::string& tex
 
     // 单条容量：GSM7 160 septet / UCS2 70 码元；超出则切分长短信。
     // 分段配额扣除 7 字节 UDH(16 位参考号)：GSM7 152 septet / UCS2 66 码元
-    bool gsm7 = sms_text_basic_gsm7(text);
-    std::vector<std::string> parts = sms_split_parts(text, gsm7, gsm7 ? 160 : 70);
+    bool gsm7 = analysis.gsm7;
+    std::vector<std::string> parts = sms_split_parts(text, analysis, gsm7 ? 160 : 70);
     if (parts.empty()) {
         message = "号码或内容无效";
         return ESP_ERR_INVALID_ARG;
     }
-    if (parts.size() > 1) parts = sms_split_parts(text, gsm7, gsm7 ? 152 : 66);
+    if (parts.size() > 1) parts = sms_split_parts(text, analysis, gsm7 ? 152 : 66);
 
     uint16_t csms = 0;
     if (parts.size() > 1) {
@@ -1297,7 +1342,13 @@ esp_err_t idf_sms_enqueue_outgoing(const std::string& phone_raw, const std::stri
         message = "错误：请输入短信内容";
         return ESP_ERR_INVALID_ARG;
     }
-    if (text.size() > 300) {
+    SmsTextAnalysis analysis;
+    esp_err_t analyze_err = sms_analyze_text(text, analysis);
+    if (analyze_err != ESP_OK) {
+        message = analyze_err == ESP_ERR_TIMEOUT ? "发送队列繁忙，请稍后再试" : "错误：短信内容不是合法 UTF-8";
+        return analyze_err;
+    }
+    if (analysis.chars.size() > 300) {
         message = "错误：短信内容超过 300 字符";
         return ESP_ERR_INVALID_SIZE;
     }
