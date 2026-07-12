@@ -897,16 +897,16 @@ static void parse_mhttp_head(const std::string& head, int http_id, IdfCellularHt
     size_t comma = head.find(',');
     if (comma == std::string::npos) return;
     if (starts_with(head, "+MHTTPURC: \"header\"")) {
-        long nums[4];
+        long nums[3];
         int n = 0;
-        if (parse_comma_longs(head.substr(comma + 1), nums, 4, n) && n >= 2 && nums[0] == http_id) {
+        if (parse_comma_longs(head.substr(comma + 1), nums, 3, n) && n >= 2 && nums[0] == http_id) {
             result.httpStatus = static_cast<int>(nums[1]);
             idf_logf("蜂窝HTTP响应状态: %d", result.httpStatus);
         }
     } else if (starts_with(head, "+MHTTPURC: \"content\"")) {
-        long nums[5];
+        long nums[4];
         int n = 0;
-        if (parse_comma_longs(head.substr(comma + 1), nums, 5, n) && n >= 4 && nums[0] == http_id) {
+        if (parse_comma_longs(head.substr(comma + 1), nums, 4, n) && n >= 4 && nums[0] == http_id) {
             result.expectedBytes = static_cast<uint32_t>(std::max<long>(0, nums[1]));
             result.bytesRead = static_cast<uint32_t>(std::max<long>(0, nums[2]));
             uint32_t current = static_cast<uint32_t>(std::max<long>(0, nums[3]));
@@ -955,7 +955,9 @@ static void append_sms_urc_line(const std::string& line)
     append_urc_text(text);
 }
 
-static bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms, IdfCellularHttpResult& result)
+static bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms,
+                                       const std::string& initial_response,
+                                       IdfCellularHttpResult& result)
 {
     TickDeadline deadline(timeout_ms);
     std::string head;
@@ -966,11 +968,9 @@ static bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms, IdfCell
     bool error = false;
     uint8_t buf[128];
 
-    while (!deadline.expired() && !complete) {
-        int got = uart_read_bytes(MODEM_UART, buf, sizeof(buf), pdMS_TO_TICKS(120));
-        if (got <= 0) continue;
-        for (int i = 0; i < got && !complete; ++i) {
-            char ch = static_cast<char>(buf[i]);
+    auto consume = [&](const char* data, size_t len) {
+        for (size_t i = 0; i < len; ++i) {
+            char ch = data[i];
             if (skipping_data) {
                 if (ch == '\n') {
                     skipping_data = false;
@@ -1006,6 +1006,13 @@ static bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms, IdfCell
                 head.clear();
             }
         }
+    };
+
+    consume(initial_response.data(), initial_response.size());
+    while (!deadline.expired() && (!complete || skipping_data)) {
+        int got = uart_read_bytes(MODEM_UART, buf, sizeof(buf), pdMS_TO_TICKS(120));
+        if (got <= 0) continue;
+        consume(reinterpret_cast<const char*>(buf), static_cast<size_t>(got));
     }
 
     if (!complete) idf_log_line("蜂窝HTTP下载等待超时");
@@ -1373,9 +1380,10 @@ static bool fetch_mhttp_once_locked(const std::string& protocol, const std::stri
 
     std::string request_cmd = "AT+MHTTPREQUEST=";
     request_cmd += std::to_string(http_id);
-    request_cmd += ",1,0,";
+    request_cmd += ",1,0,\"";
     request_cmd += hex_encode_ascii(path);
-    if (send_at_locked(request_cmd, 10000, resp) != ESP_OK) {
+    request_cmd += "\"";
+    if (send_at_locked(request_cmd, 10000, resp, 4096, 0) != ESP_OK) {
         result.message = "蜂窝HTTP请求发送失败";
         idf_logf("蜂窝HTTP请求发送失败: %s", resp.c_str());
         snprintf(cmd, sizeof(cmd), "AT+MHTTPDEL=%d", http_id);
@@ -1383,7 +1391,7 @@ static bool fetch_mhttp_once_locked(const std::string& protocol, const std::stri
         return false;
     }
 
-    bool ok = wait_mhttp_download_locked(http_id, CELLULAR_HTTP_TIMEOUT_MS, result);
+    bool ok = wait_mhttp_download_locked(http_id, CELLULAR_HTTP_TIMEOUT_MS, resp, result);
     snprintf(cmd, sizeof(cmd), "AT+MHTTPDEL=%d", http_id);
     send_at_locked(cmd, 3000, resp, 256, 20);
     if (ok) {
@@ -1783,14 +1791,22 @@ static void configure_sms_and_registration(void)
     send_ok(idf_config_net_led_enabled() ? "AT+MLED=0,1" : "AT+MLED=0,0", 1200);
 }
 
-// 查询 SIM 是否就绪：AT+CPIN? 返回 +CPIN: READY 视为有卡可用；无卡/卡故障时模组回
-// +CME ERROR(10=无卡,13=卡故障)，send_ok 返回 false。用于运行中热插拔检测。
-static bool query_sim_ready(void)
+// 仅明确的“未插卡”响应才改变热插拔状态；AT 忙、超时或 SIM 临时错误都保持未知，
+// 否则一次采样失败会制造“移除→插入”事件并反复重跑模组初始化。
+static int query_sim_presence(void)
 {
     std::string resp;
-    if (!send_ok("AT+CPIN?", 1500, &resp)) return false;
-    return resp.find("+CPIN: READY") != std::string::npos ||
-           resp.find("+CPIN:READY") != std::string::npos;
+    esp_err_t err = idf_modem_send_at("AT+CPIN?", 1500, resp);
+    if (err == ESP_OK && (resp.find("+CPIN: READY") != std::string::npos ||
+                          resp.find("+CPIN:READY") != std::string::npos)) {
+        return 1;
+    }
+    if (resp.find("+CME ERROR: 10") != std::string::npos ||
+        resp.find("+CME ERROR:10") != std::string::npos ||
+        resp.find("SIM not inserted") != std::string::npos) {
+        return 0;
+    }
+    return -1;
 }
 
 // 重启后 AT 握手失败时置位：一旦后续任何探测发现 AT 恢复，立即补跑完整初始化
@@ -2051,7 +2067,8 @@ static void modem_task(void*)
         if ((last_sim_check == 0 || now - last_sim_check > pdMS_TO_TICKS(SIM_CHECK_INTERVAL_MS)) &&
             at_channel_idle_now()) {
             last_sim_check = now;
-            int present_now = query_sim_ready() ? 1 : 0;
+            int present_now = query_sim_presence();
+            if (present_now < 0) continue;
             if (sim_present == -1) {
                 sim_present = present_now;  // 首次仅记基线，不当作插拔事件
             } else if (present_now != sim_present) {
