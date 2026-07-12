@@ -35,6 +35,8 @@
 #include "idf_sms.h"
 #include "idf_wifi.h"
 #include "mbedtls/base64.h"
+#include "mbedtls/sha256.h"
+#include "nvs.h"
 #include "web_assets.h"
 
 static const char* TAG = "idf_web";
@@ -72,6 +74,7 @@ static bool cell_job_lock(TickType_t ticks = pdMS_TO_TICKS(300));
 static void cell_job_unlock(void);
 static bool cellular_job_active_locked(void);
 static bool cellular_job_active(void);
+static void set_json_no_cache(httpd_req_t* req);
 
 static void cleanup_cell_job_mutex_if_unused()
 {
@@ -195,23 +198,59 @@ static bool auth_matches_config(const char* auth)
     return idf_config_check_web_auth(reinterpret_cast<char*>(decoded), colon + 1);
 }
 
-// 配网热点模式下允许免认证访问的接口白名单：加载配网页面(SPA 与静态资源)、
-// 读取状态/配置(密码字段已脱敏)、扫描与提交 WiFi。仅覆盖"进入配网页并配好 WiFi"
-// 所需的最小集合。
+// 配网热点模式下允许免认证访问的接口白名单：只覆盖"进入独立配网页并配好 WiFi"
+// 所需的最小集合。刻意不放行 /ui、/status、/config.json、/assets 等——配网页是
+// 自包含的独立页面，不需要它们；不放行可避免开放热点期间暴露完整后台与已有配置。
 static bool is_ap_open_uri(const char* uri)
 {
     if (!uri) return false;
-    // 静态资源按前缀放行(/assets/app.js、/assets/app.css 等)
-    if (strncmp(uri, "/assets/", 8) == 0) return true;
-    // 其余按"路径"精确匹配，忽略 ?query
+    // 按"路径"精确匹配，忽略 ?query
     size_t path_len = strcspn(uri, "?");
     static const char* const kOpen[] = {
-        "/", "/ui", "/status", "/config.json", "/wifiscan", "/wificonfig",
+        "/", "/wifiscan", "/wificonfig", "/apstatus",
     };
     for (const char* p : kOpen) {
         if (strlen(p) == path_len && strncmp(uri, p, path_len) == 0) return true;
     }
     return false;
+}
+
+// 跨站 POST 防护，按可信度分层：
+// 1. 带 X-SMS-CSRF 自定义头直接放行——跨站页面无法附带自定义头(会触发本服务不响应
+//    的 CORS 预检)，能带上的必是本站前端或用户自己的脚本；也救活反代改写 Host 的部署。
+// 2. Sec-Fetch-Site 为 cross-site 一律拒绝：现代浏览器所有请求都带该头，可补
+//    个别隐私插件剥离 Origin 造成的盲区。
+// 3. Origin 与 Host 不一致拒绝。变更类操作均已强制 POST，GET 一律放行；
+//    curl/脚本不带 Origin 与 Sec-Fetch-Site，不受影响。
+static bool origin_allowed(httpd_req_t* req)
+{
+    if (req->method != HTTP_POST) return true;
+    char csrf[8] = {};
+    if (httpd_req_get_hdr_value_str(req, "X-SMS-CSRF", csrf, sizeof(csrf)) == ESP_OK) return true;
+    char sfs[24] = {};
+    if (httpd_req_get_hdr_value_str(req, "Sec-Fetch-Site", sfs, sizeof(sfs)) == ESP_OK &&
+        strcasecmp(sfs, "cross-site") == 0) {
+        return false;
+    }
+    char origin[160] = {};
+    if (httpd_req_get_hdr_value_str(req, "Origin", origin, sizeof(origin)) != ESP_OK) return true;
+    if (strcmp(origin, "null") == 0) return false;  // 沙箱 iframe 等匿名来源
+    const char* host_part = origin;
+    const char* scheme_end = strstr(origin, "://");
+    if (scheme_end) host_part = scheme_end + 3;
+    char host[128] = {};
+    if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK) return false;
+    return strcasecmp(host_part, host) == 0;
+}
+
+static bool reject_cross_origin(httpd_req_t* req)
+{
+    if (origin_allowed(req)) return false;
+    idf_log_line("已拦截跨站 POST(Origin 与 Host 不符)");
+    httpd_resp_set_status(req, "403 Forbidden");
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_sendstr(req, "Cross-origin request rejected");
+    return true;
 }
 
 static bool check_auth(httpd_req_t* req)
@@ -221,6 +260,7 @@ static bool check_auth(httpd_req_t* req)
     // 配网页面(见 issue #1)；且开放空口上 Basic 凭据本就明文可嗅探，对这几个
     // 只读/配网接口强制认证意义不大。导出/导入/OTA/发短信/收件箱等敏感接口不在
     // 白名单内，仍需认证，避免开放热点期间泄露密钥或被滥用。
+    if (reject_cross_origin(req)) return false;
     if (idf_wifi_is_ap_mode() && is_ap_open_uri(req->uri)) return true;
 
     char auth[512] = {};
@@ -233,6 +273,17 @@ static bool check_auth(httpd_req_t* req)
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"SMS Forwarding\"");
     httpd_resp_sendstr(req, "Unauthorized");
+    return false;
+}
+
+// 写接口的跨站兜底：复用 origin_allowed 的分层判定(自定义头/Sec-Fetch-Site/Origin)，
+// 返回 JSON 错误。check_auth 已前置同一校验，这里防的是未来重构改动调用顺序。
+static bool check_csrf(httpd_req_t* req)
+{
+    if (origin_allowed(req)) return true;
+    set_json_no_cache(req);
+    httpd_resp_set_status(req, "403 Forbidden");
+    httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"跨站写入校验失败，请刷新页面后重试\"}");
     return false;
 }
 
@@ -264,7 +315,8 @@ static void set_json_no_cache(httpd_req_t* req)
 
 static bool ensure_get_or_post(httpd_req_t* req)
 {
-    if (req->method == HTTP_GET || req->method == HTTP_POST) return true;
+    if (req->method == HTTP_GET) return true;
+    if (req->method == HTTP_POST) return check_csrf(req);
     set_json_no_cache(req);
     httpd_resp_set_status(req, "405 Method Not Allowed");
     httpd_resp_set_hdr(req, "Allow", "GET, POST");
@@ -296,6 +348,10 @@ static esp_err_t send_gzip_asset(httpd_req_t* req, const WebAsset& asset, const 
 
 static esp_err_t handle_root(httpd_req_t* req)
 {
+    // 配网热点模式：只下发自包含的独立配网页(免密)，不加载完整后台，杜绝已有配置暴露
+    if (idf_wifi_is_ap_mode()) {
+        return send_gzip_asset(req, WEB_AP, "no-store, max-age=0");
+    }
     if (!check_auth(req)) return ESP_OK;
     return send_gzip_asset(req, WEB_INDEX, "no-store, max-age=0");
 }
@@ -507,6 +563,7 @@ static esp_err_t send_config_json(httpd_req_t* req)
               idf_modem_get_status().modemReady ? "true" : "false");
     body += buf;
     json_prop(body, "ntpServer", cfg.ntpServer); body += ",";
+    json_prop(body, "mdnsHost", cfg.mdnsHost); body += ",";
     snprintf(buf, sizeof(buf),
              "\"tzOffsetMin\":%d,\"rebootEnabled\":%s,\"rebootHour\":%d,"
              "\"hbEnabled\":%s,\"hbHour\":%d,\"dataEnabled\":%s,\"roamingEnabled\":%s,",
@@ -526,6 +583,16 @@ static esp_err_t send_config_json(httpd_req_t* req)
     body += "\"callNotifyEnabled\":";
     body += cfg.callNotifyEnabled ? "true" : "false";
     body += ",";
+    body += "\"wifiNetworks\":[";
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        if (i) body += ",";
+        body += "{";
+        json_prop(body, "ssid", cfg.wifiNetworks[i].ssid);
+        body += ",\"passSet\":";
+        body += cfg.wifiNetworks[i].passSet ? "true" : "false";
+        body += "}";
+    }
+    body += "],";
     body += "\"pushChannels\":[";
     for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
         if (i) body += ",";
@@ -718,6 +785,13 @@ static bool field_blank(const std::string& value)
         if (!isspace(static_cast<unsigned char>(ch))) return false;
     }
     return true;
+}
+
+static std::string redact_url_for_log(const std::string& url)
+{
+    size_t cut = url.find_first_of("?#");
+    if (cut == std::string::npos) return url;
+    return url.substr(0, cut) + "?...";
 }
 
 static bool parse_int_strict(const std::string& text, int& out)
@@ -1251,6 +1325,7 @@ static void parse_sched_tasks_form(const IdfFormFields& fields,
 static esp_err_t handle_save(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
     std::string body;
     // 16KB：5 个自定义推送模板 + 转发规则 URL 编码后可能超过 8KB
     if (read_body(req, body, 16384) != ESP_OK) return ESP_OK;
@@ -1268,12 +1343,15 @@ static esp_err_t handle_save(httpd_req_t* req)
     const bool system_sched_form = has_field(fields, "systemSchedForm");
     const bool sim_form = has_field(fields, "simForm");
     const bool call_form = has_field(fields, "callForm");
+    const bool mdns_form = has_field(fields, "mdnsForm");
+    const bool wifi_list_form = has_field(fields, "wifiListForm");
     const int form_count = (account_form ? 1 : 0) + (tz_form ? 1 : 0) +
                            (led_form ? 1 : 0) + (email_form ? 1 : 0) +
                            (push_form ? 1 : 0) + (filter_form ? 1 : 0) +
                            (rules_form ? 1 : 0) + (ka_form ? 1 : 0) +
                            (st_form ? 1 : 0) + (system_sched_form ? 1 : 0) +
-                           (sim_form ? 1 : 0) + (call_form ? 1 : 0);
+                           (sim_form ? 1 : 0) + (call_form ? 1 : 0) +
+                           (mdns_form ? 1 : 0) + (wifi_list_form ? 1 : 0);
     if (form_count != 1) {
         idf_log_line(form_count == 0 ? "网页保存请求缺少表单标记，已忽略"
                                      : "网页保存请求包含多个表单标记，已拒绝");
@@ -1308,6 +1386,36 @@ static esp_err_t handle_save(httpd_req_t* req)
                                              field_text(fields, "ntpServer"));
         if (err != ESP_OK) return fail(err);
         return ok("网页保存时间设置");
+    }
+
+    if (mdns_form) {
+        // 规范化(转小写/剥离 .local/过滤非法字符)在 idf_config_save_mdns_host 内完成，
+        // 保存成功后 mDNS 应答任务 ≤1s 切换到新主机名，无需重启
+        esp_err_t err = idf_config_save_mdns_host(field_text(fields, "mdnsHost"));
+        if (err != ESP_OK) return fail(err);
+        return ok("网页保存 mDNS 主机名");
+    }
+
+    if (wifi_list_form) {
+        // 历史 WiFi 整表保存：空 SSID 行=删除该槽位；已存网络密码留空=保持原密码。
+        // 只改列表不打断当前连接，掉线重连/重启后按新列表扫描选网
+        IdfWifiNetwork nets[IDF_MAX_WIFI_NETWORKS];
+        for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+            char key[16];
+            snprintf(key, sizeof(key), "wifi%dSsid", i);
+            nets[i].ssid = field_text(fields, key);
+            snprintf(key, sizeof(key), "wifi%dPass", i);
+            nets[i].pass = field_text(fields, key);
+        }
+        esp_err_t err = idf_config_save_wifi_networks(nets, true);
+        if (err == ESP_ERR_INVALID_ARG) {
+            set_no_cache_headers(req);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                "SSID 最长 32 字节、密码最长 64 字节");
+            return ESP_OK;
+        }
+        if (err != ESP_OK) return fail(err);
+        return ok("网页保存 WiFi 网络列表");
     }
 
     if (led_form) {
@@ -1371,7 +1479,17 @@ static esp_err_t handle_save(httpd_req_t* req)
     }
 
     if (rules_form) {
-        esp_err_t err = idf_config_save_forward_rules(field_text(fields, "forwardRules"));
+        std::string rules = field_text(fields, "forwardRules");
+        std::string rule_error;
+        esp_err_t err = idf_config_validate_forward_rules(rules, &rule_error);
+        if (err != ESP_OK) {
+            set_no_cache_headers(req);
+            std::string msg = "转发规则格式错误";
+            if (!rule_error.empty()) msg += ": " + rule_error;
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg.c_str());
+            return ESP_OK;
+        }
+        err = idf_config_save_forward_rules(rules);
         if (err != ESP_OK) return fail(err);
         return ok("网页保存转发规则");
     }
@@ -1428,6 +1546,7 @@ static esp_err_t handle_save(httpd_req_t* req)
             arg->dataChanged = data_changed;
             arg->operatorChanged = operator_changed;
             arg->dataEnabled = after.dataEnabled;
+            arg->roamingEnabled = after.roamingEnabled;  // 不带上它，漫游关闭的立即生效保护永远不触发
             arg->apn = after.apn;
             arg->operatorPlmn = after.operatorPlmn;
             if (xTaskCreate(modem_apply_task, "idf_sim_apply", 4096, arg, 3, nullptr) != pdPASS) {
@@ -1446,7 +1565,9 @@ static esp_err_t handle_save(httpd_req_t* req)
 static esp_err_t handle_export_config(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
-    std::string body = idf_config_export_text();
+    std::string full;
+    get_query_param(req, "full", full, 64);
+    std::string body = (full == "1") ? idf_config_export_text(true) : idf_config_export_text(false);
     httpd_resp_set_type(req, "text/plain; charset=utf-8");
     set_no_cache_headers(req);
     httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=sms_config.txt");
@@ -1456,6 +1577,7 @@ static esp_err_t handle_export_config(httpd_req_t* req)
 static esp_err_t handle_import_config(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
     std::string body;
     if (read_body(req, body, 16384) != ESP_OK) return ESP_OK;
     int applied = 0;
@@ -1495,6 +1617,7 @@ static void schedule_restart_or_now(const char* task_name)
 static esp_err_t handle_factory_reset(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
     esp_err_t err = idf_config_factory_reset();
     if (err == ESP_OK) idf_log_line("网页触发恢复出厂：已清除全部配置，即将重启");
     set_json_no_cache(req);
@@ -1512,21 +1635,47 @@ static esp_err_t handle_factory_reset(httpd_req_t* req)
 static esp_err_t handle_wifi_config(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
     std::string body;
     if (read_body(req, body, 1024) != ESP_OK) return ESP_OK;
     IdfFormFields fields = parse_urlencoded(body);
     const std::string* ssid = find_field(fields, "ssid");
     const std::string* pass = find_field(fields, "pass");
-    esp_err_t err = idf_config_save_wifi(ssid ? *ssid : std::string(), pass ? *pass : std::string());
+    std::string ssid_s = ssid ? *ssid : std::string();
+    std::string pass_s = pass ? *pass : std::string();
+    esp_err_t err = idf_config_save_wifi(ssid_s, pass_s);
     set_json_no_cache(req);
     if (err != ESP_OK) {
         std::string msg = "{\"success\":false,\"message\":\"WiFi 配置无效\"}";
+        return httpd_resp_send(req, msg.c_str(), msg.size());
+    }
+    if (idf_wifi_is_ap_mode()) {
+        // 配网热点内：原地 APSTA 连接、不重启，配网页轮询 /apstatus 显示 IP，
+        // 连上后由设备延时自动关闭热点(见 idf_wifi_provision_connect)
+        idf_wifi_provision_connect(ssid_s, pass_s);
+        std::string msg = "{\"success\":true,\"message\":\"已保存，正在连接\"}";
         return httpd_resp_send(req, msg.c_str(), msg.size());
     }
     std::string msg = "{\"success\":true,\"message\":\"WiFi 已保存，设备即将重启\"}";
     esp_err_t send_err = httpd_resp_send(req, msg.c_str(), msg.size());
     schedule_restart_or_now("wifi_restart");
     return send_err;
+}
+
+// 配网专用极简状态：只回连接态与本机 STA IP，绝不包含任何已有配置
+static esp_err_t handle_apstatus(httpd_req_t* req)
+{
+    if (!check_auth(req)) return ESP_OK;  // AP 模式经白名单免密；STA 模式仍需登录
+    IdfWifiStatus wifi = idf_wifi_get_status();
+    set_json_no_cache(req);
+    std::string body = "{\"apMode\":";
+    body += wifi.apMode ? "true" : "false";
+    body += ",\"connected\":";
+    body += (wifi.staConnected && !wifi.ip.empty()) ? "true" : "false";
+    body += ",\"ip\":\"";
+    body += wifi.ip;
+    body += "\"}";
+    return httpd_resp_send(req, body.c_str(), body.size());
 }
 
 static esp_err_t handle_wifi(httpd_req_t* req)
@@ -1588,9 +1737,41 @@ static bool parse_multipart_boundary(const char* content_type, std::string& mark
     return true;
 }
 
+static bool is_hex_sha256(const std::string& value)
+{
+    if (value.size() != 64) return false;
+    for (char ch : value) {
+        if (!isxdigit(static_cast<unsigned char>(ch))) return false;
+    }
+    return true;
+}
+
+static std::string hex_lower(const unsigned char* data, size_t len)
+{
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(len * 2);
+    for (size_t i = 0; i < len; ++i) {
+        out.push_back(kHex[(data[i] >> 4) & 0x0F]);
+        out.push_back(kHex[data[i] & 0x0F]);
+    }
+    return out;
+}
+
 static esp_err_t handle_ota_update(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
+
+    std::string expected_sha256;
+    get_query_param(req, "sha256", expected_sha256, 128);
+    if (!expected_sha256.empty() && !is_hex_sha256(expected_sha256)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid SHA-256");
+        return ESP_OK;
+    }
+    for (char& ch : expected_sha256) {
+        ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+    }
 
     char ctype[160] = {};
     std::string boundary_marker;
@@ -1626,10 +1807,17 @@ static esp_err_t handle_ota_update(httpd_req_t* req)
     pending.reserve(boundary_marker.size() + 1024);
     bool in_file = false;
     bool saw_boundary = false;
+    bool sha_mismatch = false;
     size_t received = 0;
     size_t written = 0;
     char buf[1024];
     const size_t keep_tail = boundary_marker.size() + 8;
+    mbedtls_sha256_context sha_ctx;
+    bool sha_active = !expected_sha256.empty();
+    if (sha_active) {
+        mbedtls_sha256_init(&sha_ctx);
+        mbedtls_sha256_starts(&sha_ctx, 0);
+    }
 
     int timeouts = 0;
     // 涓流上传防护：连续超时计数外再加总时长硬上限。局域网正常 OTA 只要几十秒，
@@ -1670,6 +1858,11 @@ static esp_err_t handle_ota_update(httpd_req_t* req)
             }
             err = esp_ota_write(ota, pending.data(), writable);
             if (err == ESP_OK) {
+                if (sha_active) {
+                    mbedtls_sha256_update(&sha_ctx,
+                                          reinterpret_cast<const unsigned char*>(pending.data()),
+                                          writable);
+                }
                 written += writable;
                 pending.erase(0, writable);
             }
@@ -1687,13 +1880,30 @@ static esp_err_t handle_ota_update(httpd_req_t* req)
                 } else {
                     err = esp_ota_write(ota, pending.data(), boundary);
                 }
-                if (err == ESP_OK) written += boundary;
+                if (err == ESP_OK) {
+                    if (sha_active) {
+                        mbedtls_sha256_update(&sha_ctx,
+                                              reinterpret_cast<const unsigned char*>(pending.data()),
+                                              boundary);
+                    }
+                    written += boundary;
+                }
             }
             saw_boundary = true;
         }
     }
 
     if (err == ESP_OK && (!in_file || !saw_boundary || written == 0)) err = ESP_ERR_INVALID_SIZE;
+    if (err == ESP_OK && sha_active) {
+        unsigned char digest[32] = {};
+        mbedtls_sha256_finish(&sha_ctx, digest);
+        std::string actual = hex_lower(digest, sizeof(digest));
+        if (actual != expected_sha256) {
+            sha_mismatch = true;
+            err = ESP_ERR_INVALID_CRC;
+        }
+    }
+    if (sha_active) mbedtls_sha256_free(&sha_ctx);
     if (err == ESP_OK) err = esp_ota_end(ota);
     else esp_ota_abort(ota);
     if (err == ESP_OK) err = esp_ota_set_boot_partition(part);
@@ -1701,9 +1911,11 @@ static esp_err_t handle_ota_update(httpd_req_t* req)
     set_json_no_cache(req);
     if (err != ESP_OK) {
         std::string body = "{\"success\":false,";
-        json_prop(body, "message", std::string("升级失败: ") + esp_err_to_name(err));
+        json_prop(body, "message", sha_mismatch ? "OTA SHA-256 校验失败，已拒绝启用该固件"
+                                                : std::string("升级失败: ") + esp_err_to_name(err));
         body += "}";
-        idf_logf("OTA 失败: %s", esp_err_to_name(err));
+        if (sha_mismatch) idf_log_line("OTA SHA-256 校验失败，已拒绝启用该固件");
+        else idf_logf("OTA 失败: %s", esp_err_to_name(err));
         return httpd_resp_send(req, body.c_str(), body.size());
     }
 
@@ -1716,6 +1928,7 @@ static esp_err_t handle_ota_update(httpd_req_t* req)
 static esp_err_t handle_send_sms(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
     std::string raw;
     if (read_body(req, raw, 2048) != ESP_OK) return ESP_OK;
     IdfFormFields fields = parse_urlencoded(raw);
@@ -1848,6 +2061,7 @@ static esp_err_t handle_coredump_download(httpd_req_t* req)
 static esp_err_t handle_coredump_clear(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
     set_json_no_cache(req);
     esp_err_t err = esp_core_dump_image_erase();
     if (err == ESP_OK) {
@@ -1893,6 +2107,7 @@ static bool query_u8_range(httpd_req_t* req, const char* key, uint8_t max_exclus
 static esp_err_t handle_delete_message(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
     uint32_t id = 0;
     bool ok = query_u32(req, "id", id) && idf_inbox_delete(id);
     set_json_no_cache(req);
@@ -1904,6 +2119,7 @@ static esp_err_t handle_delete_message(httpd_req_t* req)
 static esp_err_t handle_resend_message(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
     uint32_t id = 0;
     IdfInboxEntry entry;
     bool found = query_u32(req, "id", id) && idf_inbox_get_by_id(id, entry);
@@ -2839,11 +3055,32 @@ static bool start_sched_job(const IdfSchedRunView& cfg, int index, std::string& 
     return true;
 }
 
+// 心跳"上次发送日"落盘：重启会清掉内存标记，若重启恰在心跳小时内(如每日重启
+// 与心跳同小时)，不落盘会当天重复发送。每天最多写一次，NVS 磨损可忽略。
+static int64_t load_hb_last_day()
+{
+    nvs_handle_t h;
+    if (nvs_open("sms_state", NVS_READONLY, &h) != ESP_OK) return -1;
+    uint32_t v = 0;
+    int64_t day = (nvs_get_u32(h, "hb_day", &v) == ESP_OK) ? static_cast<int64_t>(v) : -1;
+    nvs_close(h);
+    return day;
+}
+
+static void store_hb_last_day(int64_t day)
+{
+    nvs_handle_t h;
+    if (nvs_open("sms_state", NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_u32(h, "hb_day", static_cast<uint32_t>(day));
+    nvs_commit(h);
+    nvs_close(h);
+}
+
 static void scheduler_task(void*)
 {
     uint32_t last_ka_check_ms = 0;
     bool prev_ka_enabled = false;
-    int64_t hb_last_day = -1;
+    int64_t hb_last_day = load_hb_last_day();
     int64_t rb_last_day = -1;
 
     while (true) {
@@ -2929,6 +3166,7 @@ static void scheduler_task(void*)
             // 用 > 而非 !=：NTP 回拨跨过本地午夜会让 day 变小，!= 会当天重复触发
             if (cfg.hbEnabled && hour == cfg.hbHour && day > hb_last_day) {
                 hb_last_day = day;
+                store_hb_last_day(day);
                 IdfSmsStatus sms = idf_sms_get_status();
                 char body[192];
                 snprintf(body, sizeof(body), "设备运行正常。\n累计转发: %u 条\n空闲堆: %u KB",
@@ -3044,7 +3282,7 @@ static esp_err_t handle_ping(httpd_req_t* req)
         return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"创建任务失败\"}");
     }
 
-    idf_logf("网页端发起后台HTTP payload 请求: %s", url.c_str());
+    idf_logf("网页端发起后台HTTP payload 请求: %s", redact_url_for_log(url).c_str());
     return httpd_resp_sendstr(req, "{\"success\":true,\"running\":true,\"message\":\"已开始后台HTTP payload下载，可继续刷新网页\"}");
 }
 
@@ -3365,6 +3603,7 @@ static esp_err_t handle_schedtask(httpd_req_t* req)
 static esp_err_t handle_netled(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
     set_json_no_cache(req);
     if (req->method != HTTP_POST) {
         return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"该操作需要 POST\"}");
@@ -3394,6 +3633,7 @@ static esp_err_t handle_netled(httpd_req_t* req)
 static esp_err_t handle_ntp(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
     set_json_no_cache(req);
     esp_err_t err = idf_wifi_resync_ntp();
     uint32_t now = static_cast<uint32_t>(time(nullptr));
@@ -3415,6 +3655,7 @@ static esp_err_t handle_ntp(httpd_req_t* req)
 static esp_err_t handle_reboot(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
     idf_log_line("网页触发设备重启");
     set_json_no_cache(req);
     esp_err_t send_err = httpd_resp_sendstr(req, "{\"success\":true,\"message\":\"设备即将重启\"}");
@@ -3572,6 +3813,7 @@ esp_err_t idf_web_start(void)
     IDF_WEB_TRY_REGISTER("/ntp", register_handler(s_server, "/ntp", HTTP_POST, handle_ntp));
     IDF_WEB_TRY_REGISTER("/wifiscan", httpd_register_uri_handler(s_server, &wifi_scan));
     IDF_WEB_TRY_REGISTER("/wificonfig", httpd_register_uri_handler(s_server, &wifi_config));
+    IDF_WEB_TRY_REGISTER("/apstatus", register_handler(s_server, "/apstatus", HTTP_GET, handle_apstatus));
     IDF_WEB_TRY_REGISTER("/messages", httpd_register_uri_handler(s_server, &messages));
     IDF_WEB_TRY_REGISTER("/log", httpd_register_uri_handler(s_server, &log));
     IDF_WEB_TRY_REGISTER("/keepalive", register_handler(s_server, "/keepalive", HTTP_ANY, handle_keepalive));

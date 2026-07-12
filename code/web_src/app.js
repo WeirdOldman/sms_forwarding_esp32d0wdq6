@@ -25,6 +25,16 @@
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.json();
     }
+    function csrfFetch(url, opt) {
+      opt = opt || {};
+      var headers = {};
+      if (opt.headers) {
+        Object.keys(opt.headers).forEach(function(k){ headers[k] = opt.headers[k]; });
+      }
+      headers['X-SMS-CSRF'] = '1';
+      opt.headers = headers;
+      return fetch(url, opt);
+    }
     function textOrThrow(r) {
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.text();
@@ -35,7 +45,14 @@
         [480,'UTC+8 北京/香港'], [540,'UTC+9 东京'], [420,'UTC+7 曼谷'], [330,'UTC+5:30 印度'],
         [60,'UTC+1 中欧'], [0,'UTC/GMT'], [-300,'UTC-5 纽约'], [-360,'UTC-6 芝加哥'], [-480,'UTC-8 洛杉矶']
       ];
-      return zones.map(function(z){ return '<option value="' + z[0] + '"' + (z[0] == sel ? ' selected' : '') + '>' + z[1] + '</option>'; }).join('');
+      var html = zones.map(function(z){ return '<option value="' + z[0] + '"' + (z[0] == sel ? ' selected' : '') + '>' + z[1] + '</option>'; }).join('');
+      // 导入的配置可能带非预置时区值：不追加选中项的话浏览器会回落到第一项，
+      // 下次"保存时间"就把时区悄悄改写成 UTC+8
+      var known = zones.some(function(z){ return z[0] == sel; });
+      if (!known && sel !== undefined && sel !== null && sel !== '') {
+        html += '<option value="' + parseInt(sel, 10) + '" selected>UTC 偏移 ' + parseInt(sel, 10) + ' 分钟</option>';
+      }
+      return html;
     }
     function pushTypeOptions(type) {
       var opts = [
@@ -122,8 +139,8 @@
         html += '<div class="form-group"><label>点击动作 action</label><select id="bark_action' + idx + '" data-bark-key="action"><option value="">默认</option><option value="alert">alert 弹窗</option></select></div>';
         html += '<div class="form-group"><label>通知 ID id</label><input type="text" id="bark_id' + idx + '" data-bark-key="id" placeholder="同 ID 会更新通知"></div>';
         html += '<div class="form-group"><label>其它参数</label><input type="text" id="bark_other' + idx + '" placeholder="markdown=...&ciphertext=..."></div>';
-        html += '</div><p class="form-hint">保存时会自动合成为 Bark 参数；可用 {sender} {message} {timestamp} 占位符。</p></div></details></div>';
-        html += '<div id="custom' + idx + '" style="display:none;"><div class="form-group"><label>请求体模板（使用 {sender} {message} {timestamp} 占位符）</label><textarea name="push' + idx + 'body" rows="4" style="width:100%;font-family:monospace;">' + htmlEsc(ch.customBody || '') + '</textarea></div></div>';
+        html += '</div><p class="form-hint">保存时会自动合成为 Bark 参数；可用 {sender} {receiver} {message} {timestamp} 占位符。</p></div></details></div>';
+        html += '<div id="custom' + idx + '" style="display:none;"><div class="form-group"><label>请求体模板（使用 {sender} {receiver} {local_number} {message} {timestamp} 占位符）</label><textarea name="push' + idx + 'body" rows="4" style="width:100%;font-family:monospace;">' + htmlEsc(ch.customBody || '') + '</textarea></div></div>';
         html += '<button type="button" class="btn btn-secondary btn-sm" onclick="testPush(' + idx + ', this)">测试推送</button><div class="result-box" id="pushTestResult' + idx + '"></div>';
         html += '</div></div>';
       }
@@ -138,11 +155,12 @@
         ADMIN_PHONE: htmlEsc(c.adminPhone || ''), NUMBER_BLACK_LIST: htmlEsc(c.numberBlackList || ''), FORWARD_RULES: htmlEsc(c.forwardRules || ''),
         SMTP_CHECK: c.emailConfigured ? '已配置' : '未配置', EMAIL_EN: checked(c.emailEnabled), PUSH_EN: checked(c.pushEnabled),
         MODEM_CHECK: c.modemReady ? '已就绪' : '未就绪', PUSH_COUNT: String(c.pushEnabledCount || 0), INBOX_MAX: String(c.inboxMax || ''),
-        NTP: htmlEsc(c.ntpServer || ''), RB_CHECKED: checked(c.rebootEnabled), RB_HOUR: String(c.rebootHour == null ? 3 : c.rebootHour),
+        NTP: htmlEsc(c.ntpServer || ''), MDNS_HOST: htmlEsc(c.mdnsHost || 'sms'), RB_CHECKED: checked(c.rebootEnabled), RB_HOUR: String(c.rebootHour == null ? 3 : c.rebootHour),
         HB_CHECKED: checked(c.hbEnabled), HB_HOUR: String(c.hbHour == null ? 9 : c.hbHour), TZ_OPTIONS: buildTzOptions(c.tzOffsetMin),
         DATA_CHECKED: checked(c.dataEnabled), ROAMING_CHECKED: checked(c.roamingEnabled !== false),
         APN: htmlEsc(c.apn || ''), PHONE_NUMBER: htmlEsc(c.phoneNumber || ''),
         OPERATOR_PLMN: htmlEsc(c.operatorPlmn || ''), KA_PROFILE: htmlEsc(c.kaProfile || ''), PUSH_CHANNELS: buildPushChannels(c.pushChannels),
+        WIFI_NETWORKS: buildWifiNetworks(c.wifiNetworks),
         NETLED_CHECKED: checked(c.netLedEnabled !== false), CALLNOTIFY_CHECKED: checked(c.callNotifyEnabled !== false), UPTIME: htmlEsc(c.uptimeText || '')
       };
       return html.replace(/%([A-Z0-9_]{2,})%/g, function(m, k){ return Object.prototype.hasOwnProperty.call(map, k) ? map[k] : m; });
@@ -391,13 +409,13 @@
       if (kg) kg.style.display = 'none';
       if (bp) bp.style.display = '';
       if (ba) ba.style.display = 'none';
-      if (type == 1) hint.innerHTML = 'POST JSON<br>{"sender":"+447700900123","message":"...","timestamp":"2026-01-01 12:00:00"}';
+      if (type == 1) hint.innerHTML = 'POST JSON<br>{"sender":"+447700900123","receiver":"+447700900456","message":"...","timestamp":"2026-01-01 12:00:00"}';
       else if (type == 2) { hint.innerHTML = 'Bark (iOS)<br>URL 留空使用 https://api.day.app；自建填服务器根地址，设备端发送到 /push。'; extra.style.display='block'; if(kg)kg.style.display='none'; if(ba)ba.style.display='block'; document.getElementById('urllabel'+idx).innerText='Bark 服务器 URL'; document.getElementById('url'+idx).placeholder='留空=官方服务；自建=https://bark.example.com'; document.getElementById('key1label'+idx).innerText='Device Key'; document.getElementById('key1'+idx).placeholder='Bark App 中显示的 key'; bindBarkParams(idx); loadBarkParams(idx); serializeBarkParams(idx); }
-      else if (type == 3) hint.innerHTML = 'GET 请求<br>URL?sender=xxx&message=xxx&timestamp=xxx';
+      else if (type == 3) hint.innerHTML = 'GET 请求<br>URL?sender=xxx&receiver=xxx&message=xxx&timestamp=xxx';
       else if (type == 4) { hint.innerHTML = '钉钉机器人<br>填写 Webhook 地址，加签需填 Secret'; extra.style.display='block'; document.getElementById('key1label'+idx).innerText='Secret（加签密钥，可选）'; document.getElementById('key1'+idx).placeholder='SEC...'; }
       else if (type == 5) { hint.innerHTML = 'PushPlus<br>填写 Token，URL 留空使用默认'; extra.style.display='block'; document.getElementById('key1label'+idx).innerText='Token'; document.getElementById('key1'+idx).placeholder='pushplus token'; if(kg)kg.style.display='block'; document.getElementById('key2label'+idx).innerText='发送渠道'; document.getElementById('key2'+idx).placeholder='wechat / extension / app'; }
       else if (type == 6) { hint.innerHTML = 'Server酱<br>填写 SendKey，URL 留空使用默认'; extra.style.display='block'; document.getElementById('key1label'+idx).innerText='SendKey'; document.getElementById('key1'+idx).placeholder='SCT...'; }
-      else if (type == 7) { hint.innerHTML = '自定义模板<br>使用 {sender} {message} {timestamp} 占位符'; custom.style.display='block'; }
+      else if (type == 7) { hint.innerHTML = '自定义模板<br>使用 {sender} {receiver} {local_number} {message} {timestamp} 占位符'; custom.style.display='block'; }
       else if (type == 8) { hint.innerHTML = '飞书机器人<br>填写 Webhook 地址，签名验证需填 Secret'; extra.style.display='block'; document.getElementById('key1label'+idx).innerText='Secret（签名密钥，可选）'; document.getElementById('key1'+idx).placeholder='飞书签名密钥'; }
       else if (type == 9) { hint.innerHTML = 'Gotify<br>填写服务器地址 + 应用 Token'; extra.style.display='block'; document.getElementById('key1label'+idx).innerText='Token（应用 Token）'; document.getElementById('key1'+idx).placeholder='A...'; }
       else if (type == 10) { hint.innerHTML = 'Telegram Bot<br>Chat ID（参数1）+ Bot Token（参数2）'; extra.style.display='block'; document.getElementById('key1label'+idx).innerText='Chat ID'; document.getElementById('key1'+idx).placeholder='123456789'; if(kg)kg.style.display='block'; document.getElementById('key2label'+idx).innerText='Bot Token'; document.getElementById('key2'+idx).placeholder='12345678:ABC...'; }
@@ -475,7 +493,7 @@
       if (btn) { pushTestBtns[idx] = btn; btn.disabled = true; }  // 测试期间防重复点击
       var r = document.getElementById('pushTestResult' + idx);
       r.className = 'result-box result-loading'; r.textContent = '测试推送已提交（请先保存配置）...';
-      fetch('/testpush?ch=' + idx, { method: 'POST', cache: 'no-store' }).then(jsonOrThrow).then(function(d) {
+      csrfFetch('/testpush?ch=' + idx, { method: 'POST', cache: 'no-store' }).then(jsonOrThrow).then(function(d) {
         if (d.success && d.queued) {
           r.textContent = d.message || '后台测试推送中...';
           pollTestPush(idx);
@@ -493,7 +511,7 @@
       if (!code) return;
       var r = document.getElementById('ussdResult');
       r.className = 'result-box result-loading'; r.textContent = '查询中（最长约 20 秒）...';
-      fetch('/ussd?code=' + encodeURIComponent(code), { method: 'POST', cache: 'no-store' }).then(jsonOrThrow).then(function(d) {
+      csrfFetch('/ussd?code=' + encodeURIComponent(code), { method: 'POST', cache: 'no-store' }).then(jsonOrThrow).then(function(d) {
         r.className = 'result-box ' + (d.success ? 'result-info' : 'result-error');
         r.textContent = d.message || '(无响应)';
       }).catch(function(e){ r.className = 'result-box result-error'; r.textContent = '请求失败: ' + e; });
@@ -525,7 +543,7 @@
       var btn = document.getElementById('smsSendBtn'); btn.disabled = true;
       r.className = 'result-box result-loading'; r.textContent = '提交中...';
       var body = 'phone=' + encodeURIComponent(phone) + '&content=' + encodeURIComponent(content);
-      fetch('/sendsms', { method: 'POST', cache: 'no-store', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body })
+      csrfFetch('/sendsms', { method: 'POST', cache: 'no-store', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body })
         .then(jsonOrThrow).then(function(d) {
           btn.disabled = false;
           r.className = 'result-box ' + (d.success ? 'result-success' : 'result-error'); r.textContent = d.message;
@@ -548,7 +566,7 @@
       var url=(u.value||'').trim();
       b.disabled=true;b.textContent='...';
       r.className='result-box result-loading';r.textContent='提交 payload 下载任务...';
-      fetch('/ping',{method:'POST',cache:'no-store',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(url)}).then(jsonOrThrow).then(function(d){
+      csrfFetch('/ping',{method:'POST',cache:'no-store',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(url)}).then(jsonOrThrow).then(function(d){
         if(d.success && d.running){ r.textContent='后台下载 payload 中（会短暂开启蜂窝数据）...'; pollPingStatus(); }
         else{ b.disabled=false;b.textContent='下载 payload'; r.className='result-box result-error'; r.textContent=d.message||'任务启动失败'; }
       }).catch(function(e){b.disabled=false;b.textContent='下载 payload';r.className='result-box result-error';r.textContent='请求失败: '+e;});
@@ -579,7 +597,7 @@
       if(!confirm('确定要重启WiFi吗？网页将暂时不可用。'))return;
       var r=document.getElementById('wifiResult');
       r.className='result-box result-loading';r.textContent='WiFi 重启中（约5秒）...';
-      fetch('/wifi?action=restart',{method:'POST',cache:'no-store'}).then(jsonOrThrow).then(function(d){
+      csrfFetch('/wifi?action=restart',{method:'POST',cache:'no-store'}).then(jsonOrThrow).then(function(d){
         r.className=d.success?'result-box result-success':'result-box result-error';
         r.textContent=d.message;
       }).catch(function(e){r.className='result-box result-error';r.textContent='请求失败: '+e;});
@@ -590,18 +608,18 @@
       var r=document.getElementById('flightResult');
       r.className='result-box result-loading';r.textContent='查询中...';
       fetch('/flight?action=query',{cache:'no-store'}).then(jsonOrThrow).then(function(d){
-        if(d.success){r.className='result-box result-info';r.innerHTML=d.message;}
-        else{r.className='result-box result-error';r.innerHTML='查询失败: '+d.message;}
+        if(d.success){r.className='result-box result-info';r.textContent=d.message;}
+        else{r.className='result-box result-error';r.textContent='查询失败: '+d.message;}
       }).catch(function(e){r.className='result-box result-error';r.textContent='请求失败: '+e;});
     }
     function toggleFlightMode(){
       if(!confirm('确定要切换飞行模式吗？'))return;
       var b=document.getElementById('flightBtn'),r=document.getElementById('flightResult');
       b.disabled=true;r.className='result-box result-loading';r.textContent='切换中...';
-      fetch('/flight?action=toggle',{method:'POST',cache:'no-store'}).then(jsonOrThrow).then(function(d){
+      csrfFetch('/flight?action=toggle',{method:'POST',cache:'no-store'}).then(jsonOrThrow).then(function(d){
         b.disabled=false;
-        if(d.success){r.className='result-box result-success';r.innerHTML=d.message;}
-        else{r.className='result-box result-error';r.innerHTML='切换失败: '+d.message;}
+        if(d.success){r.className='result-box result-success';r.textContent=d.message;}
+        else{r.className='result-box result-error';r.textContent='切换失败: '+d.message;}
       }).catch(function(e){b.disabled=false;r.className='result-box result-error';r.textContent='请求失败: '+e;});
     }
 
@@ -610,7 +628,7 @@
       var b=document.getElementById('ntpBtn'),r=document.getElementById('ntpResult');
       if(b){b.disabled=true;}
       r.className='result-box result-loading';r.textContent='正在向 NTP 服务器校时...';
-      fetch('/ntp',{method:'POST',cache:'no-store'}).then(jsonOrThrow).then(function(d){
+      csrfFetch('/ntp',{method:'POST',cache:'no-store'}).then(jsonOrThrow).then(function(d){
         r.className='result-box '+(d.success?'result-success':'result-error');
         r.textContent=(d.message||'')+(d.nowLocal?('　当前：'+d.nowLocal):'');
       }).catch(function(e){r.className='result-box result-error';r.textContent='请求失败: '+e;})
@@ -625,13 +643,13 @@
       if(action==='hardreset'){
         if(!confirm('硬重启将断电重启模组，确定继续？'))return;
         resultEl.className='result-box result-loading';resultEl.textContent='硬重启中（约10秒）...';
-        fetch('/modem?action=hardreset',{method:'POST',cache:'no-store'}).then(jsonOrThrow).then(function(d){
+        csrfFetch('/modem?action=hardreset',{method:'POST',cache:'no-store'}).then(jsonOrThrow).then(function(d){
           resultEl.className='result-box result-success';resultEl.textContent=d.message+' — 稍后请手动查询信号确认恢复';
         }).catch(function(e){resultEl.className='result-box result-error';resultEl.textContent='请求失败: '+e;});
         return;
       }
       resultEl.className='result-box result-loading';resultEl.textContent=name+'中...';
-      fetch('/modem?action='+action,{method:'POST',cache:'no-store'}).then(jsonOrThrow).then(function(d){
+      csrfFetch('/modem?action='+action,{method:'POST',cache:'no-store'}).then(jsonOrThrow).then(function(d){
         if(d.success){
           resultEl.className='result-box result-success';resultEl.textContent=name+'成功: '+d.message;
         }
@@ -660,11 +678,16 @@
       atHistPos=-1;atDraft='';
       btn.disabled=true;btn.textContent='...';
       addLog(cmd,'user');inp.value='';
-      fetch('/at?cmd='+encodeURIComponent(cmd), { method: 'POST', cache: 'no-store' }).then(jsonOrThrow).then(function(d){
+      csrfFetch('/at?cmd='+encodeURIComponent(cmd), { method: 'POST', cache: 'no-store' }).then(jsonOrThrow).then(function(d){
         addLog(d.message,d.success?'resp':'error');
       }).catch(function(e){addLog('网络错误: '+e,'error')}).finally(function(){btn.disabled=false;btn.textContent='发送';});
     }
-    function atQuick(cmd){var inp=document.getElementById('atCmd');if(!inp)return;inp.value=cmd;sendAT();}
+    function atQuick(cmd){
+      var inp=document.getElementById('atCmd');if(!inp)return;
+      var btn=document.getElementById('atBtn');
+      if(btn&&btn.disabled)return;  // 上一条在途：不覆盖用户草稿，sendAT 反正也会拒发
+      inp.value=cmd;sendAT();
+    }
     function clearATLog(){var l=document.getElementById('atLog');if(!l)return;l.innerHTML='';addLog('日志已清空','resp');}
     function bindAtTerminal(){
       var el = document.getElementById('atCmd');
@@ -690,7 +713,7 @@
     }
 
     // ---- Log Viewer (进入页/手动刷新重放保留日志，自动刷新只追新增) ----
-    var logTimer = null, logSince = 0, logLines = [], logLoading = false;
+    var logTimer = null, logSince = 0, logLines = [], logLoading = false, logReqSeq = 0;
     function startLogPoll() {
       if (logTimer) return;
       logTimer = setInterval(refreshLog, 2000);
@@ -741,7 +764,7 @@
     function clearCoredump(btn) {
       if (!confirm('清除设备中保存的崩溃转储？已下载的文件不受影响。')) return;
       if (btn) btn.disabled = true;
-      fetch('/coredump/clear', { method: 'POST', cache: 'no-store' }).then(jsonOrThrow).then(function(d) {
+      csrfFetch('/coredump/clear', { method: 'POST', cache: 'no-store' }).then(jsonOrThrow).then(function(d) {
         showToast(d.message || (d.success ? '已清除' : '清除失败'), d.success ? 'ok' : 'err');
       }).catch(function(e) {
         showToast('清除崩溃转储失败: ' + e, 'err');
@@ -774,7 +797,17 @@
       var reqSince = fullReload ? 0 : logSince;
       logLoading = true;
       if (fullReload) setLogStatus('正在加载设备端保留日志...');
-      fetch('/log?since=' + reqSince + '&_=' + Date.now(), { cache: 'no-store' }).then(jsonOrThrow).then(function(d) {
+      // 挂死的请求会永久卡住 logLoading，2s 轮询从此空转：8s 后主动中断/放行
+      var myReq = ++logReqSeq;
+      var ctrl = window.AbortController ? new AbortController() : null;
+      var opt = { cache: 'no-store' };
+      if (ctrl) opt.signal = ctrl.signal;
+      var timeoutId = setTimeout(function() {
+        if (myReq !== logReqSeq) return;
+        if (ctrl) ctrl.abort();
+        else logLoading = false;
+      }, 8000);
+      fetch('/log?since=' + reqSince + '&_=' + Date.now(), opt).then(jsonOrThrow).then(function(d) {
         if (!panelActive('log')) return;
         if (!d || !Array.isArray(d.lines)) return;
         if (fullReload || d.seq < logSince) logLines = [];  // 重载/设备重启 -> 重置
@@ -794,7 +827,8 @@
           setLogStatus('日志请求失败');
         }
       }).finally(function() {
-        logLoading = false;
+        clearTimeout(timeoutId);
+        if (myReq === logReqSeq) logLoading = false;
       });
     }
     // ---- Keep-Alive (保号) ----
@@ -819,7 +853,7 @@
         if (!cd) return;
         if (!d.timeValid) cd.textContent = '时间未同步，倒计时暂不可用';
         else if (!d.lastTime) cd.textContent = '尚未建立基准日，启用后首次检查时建立';
-        else cd.textContent = '上次 ' + (d.lastTimeLocal || '--') + ' · 约 ' + d.daysLeft + ' 天后';
+        else cd.textContent = '上次 ' + (d.lastTimeLocal || '--').slice(0, 10) + ' · 约 ' + d.daysLeft + ' 天后';
       }).catch(function(){});
     }
     // 保号卡：启用态高亮 + kaForm 安全 arm（与自定义任务 st* 同一套保护）
@@ -852,6 +886,9 @@
     function kaPollRunStatus() {
       if (kaRunTimer) clearTimeout(kaRunTimer);
       fetch('/keepalive?action=status&_=' + Date.now(), {cache:'no-store'}).then(jsonOrThrow).then(function(d) {
+        // 切走面板后停止轮询：否则请求在途时的 .then 会重臂定时器，
+        // 轮询在其他面板上一直弹 toast，还会覆盖诊断页正在输入的 URL
+        if (!panelActive('keepalive')) return;
         if (d.jobQueued || d.jobRunning) {
           showToast(d.jobMessage || '保号动作后台执行中…', 'loading');
           kaRunTimer = setTimeout(kaPollRunStatus, 1500);
@@ -861,13 +898,13 @@
           showToast(d.jobMessage || (d.jobSuccess ? '保号动作已完成' : '保号动作失败'), d.jobSuccess ? 'ok' : 'err');
           kaLoadStatus();
         }
-      }).catch(function(e){ showToast('状态查询失败: ' + e, 'err'); });
+      }).catch(function(e){ if (panelActive('keepalive')) showToast('状态查询失败: ' + e, 'err'); });
     }
     function kaRun() {
       showToast('正在保存并提交保号任务…', 'loading');
       kaSaveForm().then(function(saved) {
         if (!saved) { showToast('保存失败，未执行', 'err'); return; }
-        fetch('/keepalive?action=run', {method:'POST', cache:'no-store'}).then(jsonOrThrow).then(function(d) {
+        csrfFetch('/keepalive?action=run', {method:'POST', cache:'no-store'}).then(jsonOrThrow).then(function(d) {
           if (d.success && d.queued) { showToast(d.message || '保号动作已排队', 'loading'); kaPollRunStatus(); }
           else { showToast(d.message || '任务启动失败', 'err'); }
         }).catch(function(e){ showToast('请求失败: ' + e, 'err'); });
@@ -876,7 +913,7 @@
     function kaReset() {
       if (!confirm('确定把保号基准日重置为今天？')) return;
       showToast('正在重置保号基准日…', 'loading');
-      fetch('/keepalive?action=reset', {method:'POST', cache:'no-store'}).then(jsonOrThrow).then(function(d) {
+      csrfFetch('/keepalive?action=reset', {method:'POST', cache:'no-store'}).then(jsonOrThrow).then(function(d) {
         showToast(d.message || (d.success ? '保号基准日已重置为今天' : '重置失败'), d.success === false ? 'err' : 'ok');
         kaLoadStatus();
       }).catch(function(e){ showToast('请求失败: ' + e, 'err'); });
@@ -892,12 +929,18 @@
         return {v: id, t: label};
       }).filter(function(o){ return o.v; });
     }
+    var esimOptionsReq = null;  // 在途请求去重：面板初始化会同时发起 7 次调用
     function loadEsimOptions(cb) {
       if (esimOptions) { cb(esimOptions); return; }
-      fetch('/esim?action=status&_=' + Date.now(), {cache:'no-store'}).then(jsonOrThrow).then(function(d) {
-        esimOptions = profileOptionsFromProfiles(d.profiles);
-        cb(esimOptions);
-      }).catch(function(){ cb([]); });
+      if (!esimOptionsReq) {
+        esimOptionsReq = fetch('/esim?action=status&_=' + Date.now(), {cache:'no-store'})
+          .then(jsonOrThrow).then(function(d) {
+            esimOptions = profileOptionsFromProfiles(d.profiles);
+            return esimOptions;
+          }).catch(function(){ return []; })
+          .then(function(opts){ esimOptionsReq = null; return opts; });
+      }
+      esimOptionsReq.then(cb);
     }
     // 三件套约定：hiddenId(实际提交) / hiddenId+'Sel'(下拉) / hiddenId+'Custom'(手动输入)
     function profSelChange(hiddenId) {
@@ -1077,7 +1120,7 @@
       showToast('正在保存并提交任务…', 'loading');
       stSaveForm().then(function(saved) {
         if (!saved) { showToast('保存失败，未执行', 'err'); return; }
-        fetch('/schedtask?action=run&index=' + i, {method:'POST', cache:'no-store'}).then(jsonOrThrow).then(function(d) {
+        csrfFetch('/schedtask?action=run&index=' + i, {method:'POST', cache:'no-store'}).then(jsonOrThrow).then(function(d) {
           if (d.success) { showToast(d.message || '任务已排队', 'loading'); stLoadStatus(true); }
           else { showToast(d.message || '任务启动失败', 'err'); }
         }).catch(function(e){ showToast('请求失败: ' + e, 'err'); });
@@ -1085,7 +1128,7 @@
     }
     function stResetBase(i) {
       if (!confirm('把任务 ' + (i + 1) + ' 的基准日重置为今天？')) return;
-      fetch('/schedtask?action=reset&index=' + i, {method:'POST', cache:'no-store'}).then(jsonOrThrow).then(function(d) {
+      csrfFetch('/schedtask?action=reset&index=' + i, {method:'POST', cache:'no-store'}).then(jsonOrThrow).then(function(d) {
         showToast(d.message || (d.success ? '基准日已重置' : '重置失败'), d.success ? 'ok' : 'err');
         stLoadStatus(true);
       }).catch(function(e){ showToast('请求失败: ' + e, 'err'); });
@@ -1094,7 +1137,7 @@
     // ---- NET 指示灯临时开关 ----
     function netLedTemp(on) {
       showToast((on ? '正在开启' : '正在关闭') + ' NET 指示灯…', 'loading');
-      fetch('/netled?action=' + (on ? 'on' : 'off'), {method:'POST', cache:'no-store'}).then(jsonOrThrow).then(function(d) {
+      csrfFetch('/netled?action=' + (on ? 'on' : 'off'), {method:'POST', cache:'no-store'}).then(jsonOrThrow).then(function(d) {
         showToast(d.message || (d.success ? (on ? 'NET 灯已开启' : 'NET 灯已关闭') : '操作失败'), d.success ? 'ok' : 'err');
       }).catch(function(e){ showToast('请求失败: ' + e, 'err'); });
     }
@@ -1206,7 +1249,13 @@
         if (finished || seq !== statusSeq) return;
         timedOut = true;
         if (ctrl) ctrl.abort();
-        else ovSet('ovRefresh', '刷新超时');
+        else {
+          // 无 AbortController 时不能真中断：同步放开 statusLoading 闸门，
+          // 否则一个挂死的 /status 会永久冻结概览刷新
+          ovSet('ovRefresh', '刷新超时');
+          finished = true;
+          statusLoading = false;
+        }
       }, 7000);
       var url = '/status?' + (sample ? 'sample=1&' : '') + '_=' + Date.now();
       fetch(url, opt).then(jsonOrThrow).then(function(d) {
@@ -1265,7 +1314,7 @@
         if (d.apMode) {
           var lv = document.getElementById('ovLive');
           if (lv) { lv.textContent = '● 配网模式（请到 WiFi 设置配置网络）'; lv.style.color = 'var(--error)'; }
-          if (!apHandled) { apHandled = true; switchPanel('settings'); }
+          if (!apHandled) { apHandled = true; switchPanel('sim'); }  // WiFi 配网表单在 SIM/网络页
         }
       }).catch(function() {
         if (seq !== statusSeq) return;
@@ -1421,7 +1470,7 @@
       if (!confirm('确定重启设备？约 15 秒后恢复。')) return;
       var r = document.getElementById('sysResult');
       r.className = 'result-box result-loading'; r.textContent = '正在重启...';
-      fetch('/reboot', {method:'POST', cache:'no-store'}).then(jsonOrThrow).then(function(d){
+      csrfFetch('/reboot', {method:'POST', cache:'no-store'}).then(jsonOrThrow).then(function(d){
         r.className = 'result-box result-success'; r.textContent = d.message;
       }).catch(function(){ r.className = 'result-box result-info'; r.textContent = '设备正在重启，请稍后刷新页面'; });
     }
@@ -1430,7 +1479,7 @@
       if (!confirm('再次确认：账号/邮件/推送/保号等全部配置都会被清除！')) return;
       var r = document.getElementById('sysResult');
       r.className = 'result-box result-loading'; r.textContent = '正在清除配置并重启...';
-      fetch('/factory', {method:'POST', cache:'no-store'}).then(jsonOrThrow).then(function(d){
+      csrfFetch('/factory', {method:'POST', cache:'no-store'}).then(jsonOrThrow).then(function(d){
         r.className = 'result-box result-success'; r.textContent = d.message;
       }).catch(function(){ r.className = 'result-box result-info'; r.textContent = '设备正在重启，请稍后用默认账号登录'; });
     }
@@ -1526,7 +1575,7 @@
     }
     function esimStart(action, body) {
       showToast('正在提交 eSIM 任务…', 'loading');
-      fetch('/esim?action=' + encodeURIComponent(action), {method:'POST', cache:'no-store', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:body || ''}).then(jsonOrThrow).then(function(d) {
+      csrfFetch('/esim?action=' + encodeURIComponent(action), {method:'POST', cache:'no-store', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:body || ''}).then(jsonOrThrow).then(function(d) {
         if (d.success && d.queued) { showToast(d.message || 'eSIM 任务已排队', 'loading'); esimLoadStatus(true); }
         else { showToast(d.message || 'eSIM 任务启动失败', 'err'); }
       }).catch(function(e){ showToast('请求失败: ' + e, 'err'); });
@@ -1550,20 +1599,27 @@
     }
 
     // ---- WiFi settings ----
-    function wifiScan() {
+    // 扫描结果统一回填上方配网下拉：无论扫描由“扫描”按钮还是历史列表聚焦触发
+    function wifiScanFillSelect(arr) {
       var sel = document.getElementById('wifiScanSel');
-      sel.innerHTML = '<option value="">扫描中（约 3 秒）...</option>';
-      fetch('/wifiscan?_=' + Date.now(), {cache:'no-store'}).then(jsonOrThrow).then(function(arr) {
-        if (!Array.isArray(arr) || !arr.length) { sel.innerHTML = '<option value="">未发现 WiFi</option>'; return; }
-        arr.sort(function(a, b){ return b.rssi - a.rssi; });
-        sel.innerHTML = '<option value="">选择网络（共 ' + arr.length + ' 个）</option>';
-        arr.forEach(function(w) {
-          var o = document.createElement('option');
-          o.value = w.ssid;
-          o.textContent = (w.ssid || '(隐藏网络)') + '  ·  ' + w.rssi + ' dBm  ·  ' + (w.enc ? '加密' : '开放');
-          sel.appendChild(o);
-        });
-      }).catch(function(){ sel.innerHTML = '<option value="">扫描失败</option>'; });
+      if (!sel) return;
+      if (!arr.length) { sel.innerHTML = '<option value="">未发现 WiFi</option>'; return; }
+      sel.innerHTML = '<option value="">选择网络（共 ' + arr.length + ' 个）</option>';
+      arr.forEach(function(w) {
+        var o = document.createElement('option');
+        o.value = w.ssid;
+        o.textContent = (w.ssid || '(隐藏网络)') + '  ·  ' + w.rssi + ' dBm  ·  ' + (w.enc ? '加密' : '开放');
+        sel.appendChild(o);
+      });
+    }
+    function wifiScan() {  // 两张卡的“扫描”按钮共用：强制重扫并同步刷新两处下拉
+      var sel = document.getElementById('wifiScanSel');
+      if (sel) sel.innerHTML = '<option value="">扫描中（约 3 秒）...</option>';
+      wifiScanCache = null;
+      wifiScanReq = null;
+      wifiSuggestFetch().catch(function() {
+        if (sel) sel.innerHTML = '<option value="">扫描失败</option>';
+      });
     }
     function wifiPick() {
       var v = document.getElementById('wifiScanSel').value;
@@ -1576,7 +1632,7 @@
       var r = document.getElementById('wifiCfgResult');
       r.className = 'result-box result-loading'; r.textContent = '保存中，设备即将重启...';
       var body = 'ssid=' + encodeURIComponent(s) + '&pass=' + encodeURIComponent(document.getElementById('wifiPassIn').value);
-      fetch('/wificonfig', {method:'POST', cache:'no-store', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:body}).then(jsonOrThrow).then(function(d) {
+      csrfFetch('/wificonfig', {method:'POST', cache:'no-store', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:body}).then(jsonOrThrow).then(function(d) {
         r.className = 'result-box ' + (d.success ? 'result-success' : 'result-error'); r.textContent = d.message;
       }).catch(function(){ r.className = 'result-box result-info'; r.textContent = '设备正在重启，请连接目标 WiFi 后重新访问设备'; });
     }
@@ -1586,27 +1642,109 @@
         if (ssidIn && d.ssid && !d.apMode && !ssidIn.value) ssidIn.value = d.ssid;
       }).catch(function(){});
     }
+    function buildWifiNetworks(nets) {
+      nets = nets || [];
+      var html = '';
+      for (var i = 0; i < 5; i++) {
+        var n = nets[i] || {};
+        var has = !!n.ssid;
+        html += '<div class="form-group"><label class="form-label">网络 ' + (i + 1) + (i === 0 ? '（最近配网）' : '') + '</label>';
+        html += '<div style="display:flex;gap:6px;align-items:center;">';
+        html += '<div class="wifi-suggest-wrap">';
+        html += '<input class="form-input" type="text" name="wifi' + i + 'Ssid" id="wifiNetSsid' + i + '" value="' + htmlEsc(n.ssid || '') + '" placeholder="SSID（留空 = 未使用）" maxlength="32" autocomplete="off" onfocus="wifiSuggestOpen(' + i + ')" oninput="wifiSuggestOpen(' + i + ')" onblur="wifiSuggestClose(' + i + ')">';
+        html += '<div class="wifi-suggest" id="wifiSuggest' + i + '" style="display:none;"></div></div>';
+        html += '<button type="button" class="btn btn-secondary btn-sm" onclick="wifiNetClear(' + i + ')">删除</button></div>';
+        html += '<input class="form-input" type="password" name="wifi' + i + 'Pass" id="wifiNetPass' + i + '" value="" placeholder="' + (n.passSet ? '留空保持原密码' : (has ? '开放网络（无密码）' : '密码')) + '" maxlength="64" style="margin-top:4px;">';
+        html += '</div>';
+      }
+      return html;
+    }
+    function wifiNetClear(i) {
+      var s = document.getElementById('wifiNetSsid' + i), p = document.getElementById('wifiNetPass' + i);
+      if (s) s.value = '';
+      if (p) { p.value = ''; p.placeholder = '密码'; }
+    }
+    // SSID 扫描候选：首次聚焦自动扫描一次并缓存，点“扫描”按钮会刷新缓存
+    var wifiScanCache = null, wifiScanReq = null;
+    function wifiSuggestFetch() {
+      if (wifiScanCache) return Promise.resolve(wifiScanCache);
+      if (!wifiScanReq) {
+        wifiScanReq = fetch('/wifiscan?_=' + Date.now(), {cache:'no-store'}).then(jsonOrThrow).then(function(arr) {
+          arr = Array.isArray(arr) ? arr : [];
+          arr.sort(function(a, b){ return b.rssi - a.rssi; });
+          wifiScanCache = arr;
+          wifiScanFillSelect(arr);  // 任何来源的扫描都同步回填上方配网下拉
+          return arr;
+        }).catch(function(e){ wifiScanReq = null; throw e; });
+      }
+      return wifiScanReq;
+    }
+    function wifiSuggestOpen(i) {
+      var box = document.getElementById('wifiSuggest' + i);
+      var inp = document.getElementById('wifiNetSsid' + i);
+      if (!box || !inp) return;
+      box.style.display = 'block';
+      if (!wifiScanCache) box.innerHTML = '<div class="wifi-suggest-empty">扫描中（约 3 秒）...</div>';
+      wifiSuggestFetch().then(function(arr) {
+        if (box.style.display === 'none') return;   // 等待期间已失焦
+        var q = (inp.value || '').toLowerCase();
+        var items = arr.filter(function(w){ return w.ssid && (!q || w.ssid.toLowerCase().indexOf(q) >= 0); });
+        box.innerHTML = '';
+        if (!items.length) {
+          box.innerHTML = '<div class="wifi-suggest-empty">' + (arr.length ? '无匹配网络' : '未发现 WiFi') + '</div>';
+          return;
+        }
+        items.forEach(function(w) {
+          var d = document.createElement('div');
+          d.className = 'wifi-suggest-item';
+          var name = document.createElement('span'); name.textContent = w.ssid;
+          var meta = document.createElement('span'); meta.className = 'ws-meta';
+          meta.textContent = w.rssi + ' dBm · ' + (w.enc ? '加密' : '开放');
+          d.appendChild(name); d.appendChild(meta);
+          d.addEventListener('mousedown', function(e) {  // mousedown 先于 blur，选中不会被关闭吞掉
+            e.preventDefault();
+            inp.value = w.ssid;
+            box.style.display = 'none';
+          });
+          box.appendChild(d);
+        });
+      }).catch(function() {
+        if (box.style.display !== 'none') box.innerHTML = '<div class="wifi-suggest-empty">扫描失败，请点“扫描”重试</div>';
+      });
+    }
+    function wifiSuggestClose(i) {
+      var box = document.getElementById('wifiSuggest' + i);
+      if (box) box.style.display = 'none';
+    }
 
     // ---- Config backup / OTA ----
     function doExport() { location.href = '/export'; }
+    function doExportFull() {
+      if (!confirm('完整导出会包含 WiFi、Web、SMTP 和推送密钥明文。确定继续？')) return;
+      location.href = '/export?full=1';
+    }
     function doImport() {
       var t = document.getElementById('importBox').value;
       if (!t.trim()) { return; }
       if (!confirm('确定导入配置？将覆盖当前设置。')) return;
       var r = document.getElementById('importResult');
       r.className = 'result-box result-loading'; r.textContent = '导入中...';
-      fetch('/import', {method:'POST', cache:'no-store', headers:{'Content-Type':'text/plain'}, body:t}).then(jsonOrThrow).then(function(d){
+      csrfFetch('/import', {method:'POST', cache:'no-store', headers:{'Content-Type':'text/plain'}, body:t}).then(jsonOrThrow).then(function(d){
         r.className = 'result-box ' + (d.success ? 'result-success' : 'result-error'); r.textContent = d.message;
       }).catch(function(e){ r.className = 'result-box result-error'; r.textContent = '请求失败: ' + e; });
     }
     function doOta() {
       var f = document.getElementById('otaFile').files[0];
+      var shaEl = document.getElementById('otaSha256');
+      var sha256 = (shaEl && shaEl.value ? shaEl.value : '').trim().toLowerCase();
       if (!f) { alert('请先选择 .bin 固件文件'); return; }
+      if (sha256 && !/^[0-9a-f]{64}$/.test(sha256)) { alert('SHA-256 应为 64 位十六进制字符串'); return; }
       if (!confirm('确定升级固件？升级过程中请勿断电。')) return;
       var r = document.getElementById('otaResult');
       r.className = 'result-box result-loading'; r.textContent = '上传中，请勿断电...';
       var fd = new FormData(); fd.append('update', f, f.name);
-      fetch('/update', {method:'POST', cache:'no-store', body:fd}).then(jsonOrThrow).then(function(d){
+      var url = '/update' + (sha256 ? ('?sha256=' + encodeURIComponent(sha256)) : '');
+      csrfFetch(url, {method:'POST', cache:'no-store', body:fd}).then(jsonOrThrow).then(function(d){
         r.className = 'result-box ' + (d.success ? 'result-success' : 'result-error'); r.textContent = d.message;
       }).catch(function(){ r.className = 'result-box result-info'; r.textContent = '设备可能正在重启，请稍后刷新'; });
     }
@@ -1776,13 +1914,13 @@
     function resendMsg(id) {
       var r = document.getElementById('drawerRes'); if (!r) return;
       r.className = 'result-box result-loading'; r.textContent = '重发中...';
-      fetch('/resend?id=' + id, { method: 'POST', cache:'no-store' }).then(jsonOrThrow).then(function(d) {
+      csrfFetch('/resend?id=' + id, { method: 'POST', cache:'no-store' }).then(jsonOrThrow).then(function(d) {
         r.className = 'result-box ' + (d.success ? 'result-success' : 'result-error'); r.textContent = d.message;
       }).catch(function(e){ r.className = 'result-box result-error'; r.textContent = '请求失败: ' + e; });
     }
     function deleteMsg(id) {
       if (!confirm('确定删除这条短信？')) return;
-      fetch('/delete?id=' + id, { method: 'POST', cache:'no-store' }).then(jsonOrThrow).then(function(d) {
+      csrfFetch('/delete?id=' + id, { method: 'POST', cache:'no-store' }).then(jsonOrThrow).then(function(d) {
         if (d.success) { closeMsgDrawer(); loadMessages(); }
         else { var r = document.getElementById('drawerRes'); if (r) { r.className = 'result-box result-error'; r.textContent = d.message; } }
       }).catch(function(e){ var r = document.getElementById('drawerRes'); if (r) { r.className = 'result-box result-error'; r.textContent = '请求失败: ' + e; } });
@@ -1793,7 +1931,15 @@
       if (!panelActive('overview')) return;
       if (latestOtpLoading) return;
       latestOtpLoading = true;
-      fetch('/messages?limit=1&_=' + Date.now(), {cache:'no-store'}).then(jsonOrThrow).then(function(arr) {
+      // 同 refreshLog：挂死请求不能永久卡住轮询闸门
+      var ctrl = window.AbortController ? new AbortController() : null;
+      var opt = {cache:'no-store'};
+      if (ctrl) opt.signal = ctrl.signal;
+      var timeoutId = setTimeout(function() {
+        if (ctrl) ctrl.abort();
+        else latestOtpLoading = false;
+      }, 8000);
+      fetch('/messages?limit=1&_=' + Date.now(), opt).then(jsonOrThrow).then(function(arr) {
         if (!panelActive('overview')) return;
         var card = document.getElementById('otpHeroCard');
         if (!card) return;
@@ -1810,7 +1956,7 @@
         if (otp) { code.textContent = otp; code.onclick = function(){ copyText(otp, code); }; code.style.display = ''; } else { code.style.display = 'none'; }
         card.style.display = '';
         if (!m.fwd && panelActive('overview')) latestOtpTimer = setTimeout(loadLatestOtp, 1500);  // 刚入库时转发拆分可能下一帧才标记完成
-      }).catch(function(){}).then(function(){ latestOtpLoading = false; });
+      }).catch(function(){}).then(function(){ clearTimeout(timeoutId); latestOtpLoading = false; });
     }
 
     document.addEventListener('DOMContentLoaded', function() {
@@ -1840,7 +1986,7 @@
       var opt = { method: 'POST', cache: 'no-store', body: body };
       if (ctrl) opt.signal = ctrl.signal;
       var timer = setTimeout(function() { if (ctrl) ctrl.abort(); }, 12000);
-      return fetch('/save', opt).then(function(r) {
+      return csrfFetch('/save', opt).then(function(r) {
         clearTimeout(timer);
         return r;
       }, function(e) {

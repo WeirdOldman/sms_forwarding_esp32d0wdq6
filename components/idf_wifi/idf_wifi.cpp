@@ -58,9 +58,15 @@ static std::atomic<uint32_t> s_suppressed_beacon_logs{0};
 static std::atomic<bool> s_suppress_next_connect_log{false};
 static esp_timer_handle_t s_reconnect_timer = nullptr;
 static char s_ntp_server[128] = "ntp.aliyun.com";
+static esp_timer_handle_t s_ap_close_timer = nullptr;
+static std::atomic<bool> s_provisioning{false};  // 配网页触发的连接进行中：连上后延时关热点
+static constexpr uint32_t AP_PROVISION_HOLD_MS = 20000;  // 连上后保留热点让配网页显示 IP
 
 static esp_err_t start_provisioning_ap(bool manual = false);
 static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event_id, void* event_data);
+static void schedule_ap_close(uint32_t delay_ms);
+static void start_wifi_select_once(void);
+static void wifi_remember_task(void*);
 
 struct ApState {
     bool mode = false;
@@ -71,7 +77,9 @@ struct ApState {
 static ApState ap_state_snapshot()
 {
     ApState state;
-    if (s_state_mutex && xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    // portMAX_DELAY：持锁方只做几次赋值(微秒级)。带超时的版本一旦超时会把
+    // "AP 开着"误报成"AP 关闭"，后果是热点该关不关/该答不答
+    if (s_state_mutex && xSemaphoreTake(s_state_mutex, portMAX_DELAY) == pdTRUE) {
         state.mode = s_ap_mode;
         state.manual = s_ap_manual_mode;
         state.ssid = s_ap_ssid;
@@ -88,6 +96,37 @@ static void set_ap_state(bool mode, bool manual, const std::string& ssid)
         s_ap_ssid = ssid;
         xSemaphoreGive(s_state_mutex);
     }
+}
+
+// 配网连接成功后延时关闭热点：给配网页时间显示 IP，再切回纯 STA
+static void ap_close_timer_cb(void*)
+{
+    if (!ap_state_snapshot().mode) return;  // 已经关了
+    if (esp_wifi_set_mode(WIFI_MODE_STA) == ESP_OK) {
+        set_ap_state(false, false, std::string());
+        char host[33] = {};
+        idf_config_copy_mdns_host(host, sizeof(host));
+        idf_logf("配网热点已关闭，请改用设备 IP 或 http://%s.local 访问", host);
+    }
+}
+
+static void schedule_ap_close(uint32_t delay_ms)
+{
+    if (!s_ap_close_timer) {
+        const esp_timer_create_args_t targs = {
+            .callback = &ap_close_timer_cb,
+            .arg = nullptr,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "ap_close",
+            .skip_unhandled_events = true,
+        };
+        if (esp_timer_create(&targs, &s_ap_close_timer) != ESP_OK) {
+            ap_close_timer_cb(nullptr);  // 创建失败退回立即关闭，避免卡在 AP
+            return;
+        }
+    }
+    esp_timer_stop(s_ap_close_timer);
+    esp_timer_start_once(s_ap_close_timer, static_cast<uint64_t>(delay_ms) * 1000ULL);
 }
 
 static bool sta_can_connect()
@@ -310,22 +349,52 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
             idf_logf("WiFi 已连接，IP=" IPSTR, IP2STR(&event->ip_info.ip));
         }
         start_sntp_once();
+        // 同手机：成功连上的网络自动记住(任务内部去重，已知网络秒退不写 NVS)
+        if (xTaskCreate(wifi_remember_task, "idf_wifi_mem", 4096, nullptr, 2, nullptr) != pdPASS) {
+            ESP_LOGW(TAG, "WiFi 记忆任务创建失败，本次连接不自动记入历史列表");
+        }
         if (s_wifi_event_group) {
             xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
             xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         }
         ApState ap = ap_state_snapshot();
-        if (ap.mode && !ap.manual && s_has_sta_credentials.load(std::memory_order_relaxed)) {
-            if (esp_wifi_set_mode(WIFI_MODE_STA) == ESP_OK) {
-                set_ap_state(false, false, std::string());
-                idf_log_line("STA 已恢复连接，已关闭配网热点");
+        if (ap.mode && s_has_sta_credentials.load(std::memory_order_relaxed)) {
+            if (s_provisioning.exchange(false, std::memory_order_relaxed)) {
+                // 配网页触发的连接成功：先留住热点让配网页显示 IP，再延时自动关闭
+                schedule_ap_close(AP_PROVISION_HOLD_MS);
+                idf_logf("配网连接成功，%lu 秒后自动关闭热点",
+                         static_cast<unsigned long>(AP_PROVISION_HOLD_MS / 1000));
+            } else if (!ap.manual) {
+                if (esp_wifi_set_mode(WIFI_MODE_STA) == ESP_OK) {
+                    set_ap_state(false, false, std::string());
+                    idf_log_line("STA 已恢复连接，已关闭配网热点");
+                }
             }
         }
     }
 }
 
+// 类手机行为：STA 成功拿到 IP 后把当前凭据记入历史 WiFi(新网络/密码变更才落盘，
+// idf_config_note_wifi_connected 内部去重)。放独立一次性任务执行：系统事件任务
+// 栈小，NVS 落盘也不该阻塞事件循环
+static void wifi_remember_task(void*)
+{
+    wifi_config_t cfg = {};
+    if (esp_wifi_get_config(WIFI_IF_STA, &cfg) == ESP_OK && cfg.sta.ssid[0]) {
+        char ssid[33] = {};
+        char pass[65] = {};
+        memcpy(ssid, cfg.sta.ssid, sizeof(cfg.sta.ssid));
+        memcpy(pass, cfg.sta.password, sizeof(cfg.sta.password));
+        idf_config_note_wifi_connected(ssid, pass);
+    }
+    vTaskDelete(nullptr);
+}
+
 // 15s 周期重连看门狗：事件链(断开→重连)任何一环失败(如扫描期间 esp_wifi_connect
 // 返回错误)都不会再有新事件，仅靠事件驱动设备会永久离线。这里兜底补发连接。
+// 存了多组历史 WiFi 时改为触发扫描选网(设备可能已被搬到另一网络覆盖下)；
+// 运行时掉线只静默重连/重扫，不会自动开配网热点(无人值守设备遇路由器宕机
+// 不该广播开放 AP 扩大攻击面)。
 static void reconnect_watchdog_cb(void*)
 {
     if (!s_started.load(std::memory_order_relaxed) || !sta_can_connect()) return;
@@ -334,6 +403,10 @@ static void reconnect_watchdog_cb(void*)
     ++tick;
     // 配网热点开启时降频到 60s：连接尝试会把 STA 拉去跑信道，影响 AP 客户端与扫描
     if (ap_state_snapshot().mode && (tick % 4) != 0) return;
+    if (idf_config_wifi_network_count() > 1) {
+        start_wifi_select_once();  // 扫描(约 2-3s)在独立小任务里做，不阻塞 esp_timer
+        return;
+    }
     esp_err_t err = esp_wifi_connect();
     if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
         ESP_LOGW(TAG, "看门狗重连发起失败: %s", esp_err_to_name(err));
@@ -395,6 +468,7 @@ static void dns_captive_task(void*)
         if (question_end + 16 > static_cast<int>(sizeof(resp))) continue;
         memcpy(resp, req, question_end);
         resp[2] = 0x81; resp[3] = 0x80;  // standard response, no error
+        resp[4] = 0x00; resp[5] = 0x01;  // 只回带了第一个问题，qdcount 必须同步改成 1
         resp[6] = 0x00; resp[7] = 0x01;  // one A answer
         resp[8] = resp[9] = resp[10] = resp[11] = 0;
         int out = question_end;
@@ -424,32 +498,138 @@ static void start_dns_task_once()
     }
 }
 
-static bool mdns_query_matches_sms_local(const uint8_t* packet, int len, int offset)
+// —— 轻量 mDNS 应答器，服务 <host>.local(主机名可配置，默认 sms，issue #9) ——
+// 针对"sms.local 先能用、几分钟后失效"做过的关键修复：
+// 1) 组播成员每 60s 强制退组重加。IGMP snooping 交换机/网状路由在无查询器的
+//    家庭网络里几分钟就老化转发表项，而 lwIP 对已加入的组不会重发 IGMP 报告，
+//    必须周期性 DROP+ADD 逼它重发，否则设备从此收不到任何查询；
+// 2) STA 与 AP 两张网卡同时加组(配网保持期手机在热点侧也能解析)；
+// 3) 来源端口≠5353 的一次性/传统查询按 RFC 6762 §6.7 单播回源端口：复制查询
+//    ID、回带问题段、TTL≤10s、不设 cache-flush，路由器 DNS 代理类客户端才收得到；
+// 4) QU 位按单播应答；AAAA 查询回 NSEC(声明只有 A)，双栈解析器不必等超时；
+// 5) 新加组后主动通告两次，客户端无需等到下次查询。
+
+// 主机名 DNS 编码 "\xNN<host>\x05local"；应答任务每秒节拍从配置刷新，
+// 网页保存新主机名后 ≤1s 生效并主动通告，无需重启
+static constexpr size_t MDNS_NAME_CAP = 40;  // 1 + 32(主机名上限) + 1 + 5("local") = 39
+
+static size_t mdns_encode_name(const char* host, uint8_t* out)
 {
-    static constexpr char kName[] = "\x03sms\x05local";
+    size_t host_len = strlen(host);
+    if (host_len == 0 || host_len > 32) { host = "sms"; host_len = 3; }
+    size_t n = 0;
+    out[n++] = static_cast<uint8_t>(host_len);
+    memcpy(out + n, host, host_len);
+    n += host_len;
+    out[n++] = 5;
+    memcpy(out + n, "local", 5);
+    return n + 5;
+}
+
+static bool mdns_query_matches_host(const uint8_t* packet, int len, int offset,
+                                    const uint8_t* name, size_t name_len)
+{
+    // 逐字节比较编码名(长度字节 ≤32 不落在大写字母区间，统一转小写不会误伤)
     int pos = offset;
-    for (size_t i = 0; i < sizeof(kName) - 1; ++i) {
+    for (size_t i = 0; i < name_len; ++i) {
         if (pos >= len) return false;
         char a = static_cast<char>(packet[pos++]);
-        char b = kName[i];
+        char b = static_cast<char>(name[i]);
         if (a >= 'A' && a <= 'Z') a = static_cast<char>(a - 'A' + 'a');
         if (a != b) return false;
     }
     return pos < len && packet[pos] == 0;
 }
 
-static bool mdns_current_ip(uint8_t out[4])
+// 依据询问方地址选择要通告的 IP：热点网段的客户端给热点 IP，其余给 STA IP
+static bool mdns_pick_ip(uint32_t from_addr, uint8_t out[4])
 {
+    bool ap = ap_state_snapshot().mode;
+    if (ap && (from_addr & inet_addr("255.255.255.0")) == inet_addr("192.168.1.0")) {
+        out[0] = 192; out[1] = 168; out[2] = 1; out[3] = 1;
+        return true;
+    }
     esp_netif_ip_info_t ip = {};
     if (s_sta_netif && esp_netif_get_ip_info(s_sta_netif, &ip) == ESP_OK && ip.ip.addr != 0) {
         memcpy(out, &ip.ip.addr, 4);
         return true;
     }
-    if (ap_state_snapshot().mode) {
+    if (ap) {
         out[0] = 192; out[1] = 168; out[2] = 1; out[3] = 1;
         return true;
     }
     return false;
+}
+
+struct MdnsAnswerPlan {
+    bool wantA = false;
+    bool wantNsec = false;   // AAAA 查询 → NSEC"仅存在 A 记录"
+    bool legacy = false;     // 来源端口≠5353 的传统查询
+    bool unicast = false;    // legacy 或 QU 位
+    uint16_t id = 0;
+    uint16_t firstQtype = 0;
+};
+
+static int mdns_append_name(uint8_t* buf, int out, const uint8_t* name, size_t name_len)
+{
+    memcpy(buf + out, name, name_len);
+    out += name_len;
+    buf[out++] = 0;
+    return out;
+}
+
+static int mdns_append_ttl(uint8_t* buf, int out, uint32_t ttl)
+{
+    buf[out++] = static_cast<uint8_t>(ttl >> 24);
+    buf[out++] = static_cast<uint8_t>(ttl >> 16);
+    buf[out++] = static_cast<uint8_t>(ttl >> 8);
+    buf[out++] = static_cast<uint8_t>(ttl);
+    return out;
+}
+
+// resp 至少 256 字节：主机名取上限 32 时，头 12 + 问题 45 + A 记录 55 + NSEC 96 ≈ 208
+static int mdns_build_response(uint8_t* resp, const MdnsAnswerPlan& plan, const uint8_t ip[4],
+                               const uint8_t* name, size_t name_len)
+{
+    uint32_t ttl = plan.legacy ? 10 : 120;             // RFC 6762 §6.7 传统应答 TTL≤10s
+    uint16_t rrclass = plan.legacy ? 0x0001 : 0x8001;  // 传统应答不设 cache-flush 位
+    int an = (plan.wantA ? 1 : 0) + (plan.wantNsec ? 1 : 0);
+    int out = 0;
+    resp[out++] = static_cast<uint8_t>(plan.id >> 8);
+    resp[out++] = static_cast<uint8_t>(plan.id);
+    resp[out++] = 0x84; resp[out++] = 0x00;            // response + authoritative
+    resp[out++] = 0; resp[out++] = plan.legacy ? 1 : 0;
+    resp[out++] = 0; resp[out++] = static_cast<uint8_t>(an);
+    resp[out++] = 0; resp[out++] = 0;
+    resp[out++] = 0; resp[out++] = 0;
+    if (plan.legacy) {  // 传统应答需回带问题段
+        out = mdns_append_name(resp, out, name, name_len);
+        resp[out++] = static_cast<uint8_t>(plan.firstQtype >> 8);
+        resp[out++] = static_cast<uint8_t>(plan.firstQtype);
+        resp[out++] = 0; resp[out++] = 1;
+    }
+    if (plan.wantA) {
+        out = mdns_append_name(resp, out, name, name_len);
+        resp[out++] = 0; resp[out++] = 1;  // A
+        resp[out++] = static_cast<uint8_t>(rrclass >> 8);
+        resp[out++] = static_cast<uint8_t>(rrclass);
+        out = mdns_append_ttl(resp, out, ttl);
+        resp[out++] = 0; resp[out++] = 4;
+        memcpy(resp + out, ip, 4); out += 4;
+    }
+    if (plan.wantNsec) {
+        out = mdns_append_name(resp, out, name, name_len);
+        resp[out++] = 0; resp[out++] = 0x2F;  // NSEC
+        resp[out++] = static_cast<uint8_t>(rrclass >> 8);
+        resp[out++] = static_cast<uint8_t>(rrclass);
+        out = mdns_append_ttl(resp, out, ttl);
+        uint16_t rdlen = static_cast<uint16_t>(name_len + 1 + 3);  // next domain + 位图 3
+        resp[out++] = static_cast<uint8_t>(rdlen >> 8);
+        resp[out++] = static_cast<uint8_t>(rdlen);
+        out = mdns_append_name(resp, out, name, name_len);  // next domain = 自身
+        resp[out++] = 0; resp[out++] = 1; resp[out++] = 0x40;  // 窗口 0 长度 1，仅类型 1(A)
+    }
+    return out;
 }
 
 static void mdns_sms_task(void*)
@@ -483,65 +663,142 @@ static void mdns_sms_task(void*)
     uint8_t ttl = 255;  // RFC 6762 要求组播 TTL=255
     setsockopt(sock, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
 
-    auto join_group = [sock]() {
-        ip_mreq mreq = {};
-        mreq.imr_multiaddr.s_addr = inet_addr("224.0.0.251");
-        mreq.imr_interface.s_addr = htonl(INADDR_ANY);
-        return setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) == 0;
-    };
-    // 任务启动早于任何网卡拿到 IP，首次加组可能失败——失败则周期重试，
-    // 否则收不到 224.0.0.251 的查询，sms.local 整个运行期都静默失效
-    bool joined = join_group();
-    if (joined) idf_log_line("mDNS 已启动: http://sms.local");
-    else idf_log_line("mDNS 加入组播组失败，稍后自动重试");
+    // 可配置主机名(issue #9)：任务内缓存编码名，每秒节拍比对配置，变更即切换
+    char host[33] = {};
+    uint8_t name[MDNS_NAME_CAP];
+    size_t name_len = 0;
+    idf_config_copy_mdns_host(host, sizeof(host));
+    name_len = mdns_encode_name(host, name);
 
+    auto sta_addr = []() -> uint32_t {
+        esp_netif_ip_info_t ip = {};
+        if (s_sta_netif && esp_netif_get_ip_info(s_sta_netif, &ip) == ESP_OK && ip.ip.addr != 0) {
+            return ip.ip.addr;  // 网络字节序
+        }
+        return 0;
+    };
+    auto ap_addr = []() -> uint32_t {
+        return ap_state_snapshot().mode ? inet_addr("192.168.1.1") : 0;
+    };
+    // 退组再加组：既处理网卡/IP 变化，也用于周期性逼 lwIP 重发 IGMP 报告
+    // (对已加入的组重复 ADD 只会加引用计数，不会重发报告)。返回"是否新加入"。
+    auto refresh_membership = [&](uint32_t& tracked, uint32_t cur, bool force) -> bool {
+        if (cur == tracked && !force) return false;
+        bool changed = (cur != tracked);
+        if (tracked != 0) {
+            ip_mreq d = {};
+            d.imr_multiaddr.s_addr = inet_addr("224.0.0.251");
+            d.imr_interface.s_addr = tracked;
+            setsockopt(sock, IPPROTO_IP, IP_DROP_MEMBERSHIP, &d, sizeof(d));
+            tracked = 0;
+        }
+        if (cur != 0) {
+            ip_mreq a = {};
+            a.imr_multiaddr.s_addr = inet_addr("224.0.0.251");
+            a.imr_interface.s_addr = cur;
+            if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &a, sizeof(a)) == 0) {
+                tracked = cur;
+                if (changed) {
+                    idf_logf("mDNS 已加入组播: http://%s.local", host);
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    uint32_t joined_sta = 0;
+    uint32_t joined_ap = 0;
+    int64_t last_refresh_us = esp_timer_get_time();
+    int announce_left = 0;
     uint8_t req[512];
-    int retry_countdown = 0;
+    uint8_t resp[256];
+
     while (true) {
         sockaddr_in from = {};
         socklen_t from_len = sizeof(from);
         int len = recvfrom(sock, req, sizeof(req), 0, reinterpret_cast<sockaddr*>(&from), &from_len);
         // 同配网 DNS：立即报错时让出 CPU，防止 lwIP 内存紧张期高优先级忙等
         if (len < 0 && errno != EWOULDBLOCK && errno != EAGAIN) vTaskDelay(pdMS_TO_TICKS(200));
-        if (!joined && ++retry_countdown >= 15) {  // recv 超时 1s，约每 15s 重试加组
-            retry_countdown = 0;
-            joined = join_group();
-            if (joined) idf_log_line("mDNS 已启动: http://sms.local");
+
+        // 主机名热更新：网页保存后下一个节拍(≤1s)换名，换名立即主动通告新名字
+        {
+            char cur_host[33] = {};
+            idf_config_copy_mdns_host(cur_host, sizeof(cur_host));
+            if (strcmp(cur_host, host) != 0) {
+                strcpy(host, cur_host);
+                name_len = mdns_encode_name(host, name);
+                announce_left = 2;
+                idf_logf("mDNS 主机名已切换: http://%s.local", host);
+            }
         }
+
+        // recv 超时约 1s 一轮：网卡一变立即迁移；每 60s 强制刷新对抗 snooping 老化
+        int64_t now_us = esp_timer_get_time();
+        bool force = (now_us - last_refresh_us) >= 60000000LL;
+        if (force) last_refresh_us = now_us;
+        bool newly_joined = refresh_membership(joined_sta, sta_addr(), force);
+        newly_joined = refresh_membership(joined_ap, ap_addr(), force) || newly_joined;
+        if (newly_joined) announce_left = 2;
+        if (announce_left > 0) {
+            // 主动通告：相邻两次天然间隔≥1s(recv 超时节拍)
+            uint8_t ip[4] = {};
+            if (mdns_pick_ip(0, ip)) {
+                MdnsAnswerPlan ann;
+                ann.wantA = true;
+                int n = mdns_build_response(resp, ann, ip, name, name_len);
+                sockaddr_in dst = {};
+                dst.sin_family = AF_INET;
+                dst.sin_port = htons(5353);
+                dst.sin_addr.s_addr = inet_addr("224.0.0.251");
+                sendto(sock, resp, n, 0, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+            }
+            --announce_left;
+        }
+
         if (len < 12) continue;
+        if (req[2] & 0xF8) continue;  // 忽略响应包(QR=1)与非标准 opcode
+
         uint16_t qd = (static_cast<uint16_t>(req[4]) << 8) | req[5];
         int pos = 12;
-        bool match = false;
-        for (uint16_t q = 0; q < qd && pos + 5 < len; ++q) {
-            if (mdns_query_matches_sms_local(req, len, pos)) match = true;
-            while (pos < len && req[pos] != 0) pos += req[pos] + 1;
-            pos += 5;
+        MdnsAnswerPlan plan;
+        plan.legacy = (from.sin_port != htons(5353));
+        if (plan.legacy) plan.id = (static_cast<uint16_t>(req[0]) << 8) | req[1];
+        for (uint16_t q = 0; q < qd && pos < len; ++q) {
+            bool matched = mdns_query_matches_host(req, len, pos, name, name_len);
+            // 跳过名字：0xC0 开头的压缩指针是 2 字节终结符，不能当长度前缀
+            while (pos < len) {
+                uint8_t b = req[pos];
+                if (b == 0) { pos += 1; break; }
+                if (b >= 0xC0) { pos += 2; break; }
+                pos += b + 1;
+            }
+            if (pos + 4 > len) break;
+            uint16_t qtype = (static_cast<uint16_t>(req[pos]) << 8) | req[pos + 1];
+            uint16_t qclass = (static_cast<uint16_t>(req[pos + 2]) << 8) | req[pos + 3];
+            pos += 4;
+            if (!matched) continue;
+            if (qtype == 1 || qtype == 255) plan.wantA = true;
+            else if (qtype == 28) plan.wantNsec = true;
+            else continue;
+            if (plan.firstQtype == 0) plan.firstQtype = qtype;
+            if (qclass & 0x8000) plan.unicast = true;  // QU 位：请求单播应答
         }
+        if (!plan.wantA && !plan.wantNsec) continue;
+        if (plan.legacy) plan.unicast = true;
+
         uint8_t ip[4] = {};
-        if (!match || !mdns_current_ip(ip)) continue;
-
-        uint8_t resp[96];
-        int out = 0;
-        resp[out++] = 0; resp[out++] = 0;      // mDNS transaction id
-        resp[out++] = 0x84; resp[out++] = 0x00; // response + authoritative
-        resp[out++] = 0; resp[out++] = 0;      // questions
-        resp[out++] = 0; resp[out++] = 1;      // answers
-        resp[out++] = 0; resp[out++] = 0;      // authority
-        resp[out++] = 0; resp[out++] = 0;      // additional
-        resp[out++] = 3; memcpy(resp + out, "sms", 3); out += 3;
-        resp[out++] = 5; memcpy(resp + out, "local", 5); out += 5;
-        resp[out++] = 0;
-        resp[out++] = 0; resp[out++] = 1;      // A
-        resp[out++] = 0x80; resp[out++] = 1;   // cache-flush + IN
-        resp[out++] = 0; resp[out++] = 0; resp[out++] = 0; resp[out++] = 120;
-        resp[out++] = 0; resp[out++] = 4;
-        memcpy(resp + out, ip, 4); out += 4;
-
+        if (!mdns_pick_ip(from.sin_addr.s_addr, ip)) continue;
+        int n = mdns_build_response(resp, plan, ip, name, name_len);
         sockaddr_in dst = {};
-        dst.sin_family = AF_INET;
-        dst.sin_port = htons(5353);
-        dst.sin_addr.s_addr = inet_addr("224.0.0.251");
-        sendto(sock, resp, out, 0, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+        if (plan.unicast) {
+            dst = from;
+        } else {
+            dst.sin_family = AF_INET;
+            dst.sin_port = htons(5353);
+            dst.sin_addr.s_addr = inet_addr("224.0.0.251");
+        }
+        sendto(sock, resp, n, 0, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
     }
 }
 
@@ -549,7 +806,8 @@ static void start_mdns_task_once()
 {
     bool expected = false;
     if (!s_mdns_task_started.compare_exchange_strong(expected, true, std::memory_order_relaxed)) return;
-    BaseType_t ok = xTaskCreate(mdns_sms_task, "idf_mdns", 3072, nullptr, 2, nullptr);
+    // 3456：resp 缓冲扩到 256(可配置主机名后应答报文变长) + 主机名缓存
+    BaseType_t ok = xTaskCreate(mdns_sms_task, "idf_mdns", 3456, nullptr, 2, nullptr);
     if (ok != pdPASS) {
         s_mdns_task_started.store(false, std::memory_order_relaxed);
         idf_log_line("mDNS responder 启动失败");
@@ -659,26 +917,106 @@ static void provision_button_task(void*)
     }
 }
 
-// 只发起 STA 连接不等待结果；首连成败由 sta_connect_watch_task 后台判定。
-// 这样 app_main 不再被首连(最长 20s)阻塞，Web/推送/模组/短信与 WiFi 连接并行启动。
-static esp_err_t connect_sta_begin(const IdfConfig& config)
+// 应用凭据并发起 STA 连接(不等待结果)。配网热点开着时保持 APSTA 不踢热点。
+static esp_err_t wifi_apply_and_connect(const std::string& ssid, const std::string& pass)
 {
     wifi_config_t sta_config = {};
-    strlcpy(reinterpret_cast<char*>(sta_config.sta.ssid), config.wifiSsid.c_str(), sizeof(sta_config.sta.ssid));
-    strlcpy(reinterpret_cast<char*>(sta_config.sta.password), config.wifiPass.c_str(), sizeof(sta_config.sta.password));
+    strlcpy(reinterpret_cast<char*>(sta_config.sta.ssid), ssid.c_str(), sizeof(sta_config.sta.ssid));
+    strlcpy(reinterpret_cast<char*>(sta_config.sta.password), pass.c_str(), sizeof(sta_config.sta.password));
     sta_config.sta.scan_method = WIFI_FAST_SCAN;
     sta_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
     sta_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
 
-    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_err_t err = esp_wifi_set_mode(ap_state_snapshot().mode ? WIFI_MODE_APSTA : WIFI_MODE_STA);
     if (err != ESP_OK) return err;
     err = esp_wifi_set_config(WIFI_IF_STA, &sta_config);
     if (err != ESP_OK) return err;
     s_sta_configured.store(true, std::memory_order_relaxed);
-    err = esp_wifi_connect();
+    return esp_wifi_connect();
+}
+
+// —— 历史 WiFi 扫描选网(取代固定顺序盲试，见 issue #9 讨论) ——
+// 存了多组网络时，先做一次约 2-3s 的全信道扫描，把结果与已存列表匹配，直连
+// 在场且信号最好的一组；扫描不到任何已存网络(隐藏 SSID 或全部不在场)时按轮转
+// 索引逐组兜底，避免每组各吃 20s 连接超时的顺序盲等。
+static std::atomic<bool> s_select_running{false};
+static std::atomic<uint32_t> s_fallback_rotation{0};
+
+static void wifi_select_task(void*)
+{
+    do {
+        std::vector<IdfWifiNetwork> nets = idf_config_get_wifi_networks();
+        if (nets.empty()) break;
+        int chosen = -1;
+        int best_rssi = -128;
+        if (nets.size() > 1) {
+            wifi_scan_config_t scan_cfg = {};  // 全信道主动扫描；隐藏 AP 不带 SSID，无法按名匹配
+            if (esp_wifi_scan_start(&scan_cfg, true) == ESP_OK) {
+                // 逐条取记录：只需每个已存网络的最好 RSSI，不用整块拷 40 条(约 3KB)进堆
+                uint16_t total = 0;
+                esp_wifi_scan_get_ap_num(&total);
+                wifi_ap_record_t rec;
+                for (uint16_t r = 0; r < total; ++r) {
+                    if (esp_wifi_scan_get_ap_record(&rec) != ESP_OK) break;
+                    const char* seen = reinterpret_cast<const char*>(rec.ssid);
+                    for (size_t i = 0; i < nets.size(); ++i) {
+                        if (nets[i].ssid == seen && rec.rssi > best_rssi) {
+                            best_rssi = rec.rssi;
+                            chosen = static_cast<int>(i);
+                        }
+                    }
+                }
+                esp_wifi_clear_ap_list();  // 释放驱动侧未取完的扫描记录
+            }
+        }
+        if (chosen >= 0) {
+            idf_logf("扫描命中已存 WiFi: %s (RSSI %d)，直接连接", nets[chosen].ssid.c_str(), best_rssi);
+        } else if (nets.size() == 1) {
+            chosen = 0;
+        } else {
+            chosen = static_cast<int>(s_fallback_rotation.fetch_add(1, std::memory_order_relaxed) % nets.size());
+            idf_logf("扫描未见已存 WiFi，轮流尝试: %s", nets[chosen].ssid.c_str());
+        }
+        esp_err_t err = wifi_apply_and_connect(nets[chosen].ssid, nets[chosen].pass);
+        if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
+            ESP_LOGW(TAG, "选网后连接发起失败: %s", esp_err_to_name(err));
+        }
+    } while (false);
+    s_select_running.store(false, std::memory_order_relaxed);
+    vTaskDelete(nullptr);
+}
+
+static void start_wifi_select_once(void)
+{
+    bool expected = false;
+    if (!s_select_running.compare_exchange_strong(expected, true, std::memory_order_relaxed)) return;
+    // 4096：扫描记录放堆上(vector)，但 esp_wifi 扫描 API + 字符串/日志格式化仍需余量
+    if (xTaskCreate(wifi_select_task, "idf_wifi_sel", 4096, nullptr, 2, nullptr) != pdPASS) {
+        s_select_running.store(false, std::memory_order_relaxed);
+        idf_log_line("WiFi 选网任务启动失败，按当前配置直连");
+        if (sta_can_connect()) esp_wifi_connect();
+    }
+}
+
+// 只发起 STA 连接不等待结果；首连成败由 sta_connect_watch_task 后台判定。
+// 这样 app_main 不再被首连(最长 20s)阻塞，Web/推送/模组/短信与 WiFi 连接并行启动。
+// 单组网络直连(免扫描且兼容隐藏 SSID)；多组网络走扫描选网任务。
+static esp_err_t connect_sta_begin(const IdfConfig& config)
+{
+    int count = 0;
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        if (!config.wifiNetworks[i].ssid.empty()) ++count;
+    }
+    if (count > 1) {
+        idf_logf("已存 %d 组 WiFi，扫描选择在场信号最好的网络…", count);
+        start_wifi_select_once();
+        return ESP_OK;
+    }
+    const IdfWifiNetwork& net = config.wifiNetworks[0];
+    esp_err_t err = wifi_apply_and_connect(net.ssid, net.pass);
     if (err != ESP_OK) return err;
-    ESP_LOGI(TAG, "连接 WiFi: %s%s", config.wifiSsid.c_str(), config.wifiFromFallback ? " (fallback)" : "");
-    idf_logf("连接 WiFi: %s%s", config.wifiSsid.c_str(), config.wifiFromFallback ? " (fallback)" : "");
+    ESP_LOGI(TAG, "连接 WiFi: %s%s", net.ssid.c_str(), config.wifiFromFallback ? " (fallback)" : "");
+    idf_logf("连接 WiFi: %s%s", net.ssid.c_str(), config.wifiFromFallback ? " (fallback)" : "");
     return ESP_OK;
 }
 
@@ -715,7 +1053,7 @@ esp_err_t idf_wifi_start(const IdfConfig& config)
         cleanup_wifi_start_resources(false, false, false);
         return ESP_ERR_NO_MEM;
     }
-    s_has_sta_credentials.store(!config.wifiSsid.empty(), std::memory_order_relaxed);
+    s_has_sta_credentials.store(!config.wifiNetworks[0].ssid.empty(), std::memory_order_relaxed);
 
     s_sta_netif = esp_netif_create_default_wifi_sta();
     s_ap_netif = esp_netif_create_default_wifi_ap();
@@ -802,7 +1140,7 @@ esp_err_t idf_wifi_start(const IdfConfig& config)
         }
     }
 
-    if (config.wifiSsid.empty()) {
+    if (config.wifiNetworks[0].ssid.empty()) {
         ESP_LOGW(TAG, "未配置 WiFi，进入配网 AP");
         idf_log_line("未配置 WiFi，进入配网 AP");
         return start_provisioning_ap(false);
@@ -844,6 +1182,31 @@ esp_err_t idf_wifi_reconnect(void)
     if (!sta_can_connect()) return ESP_ERR_INVALID_STATE;
     xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
     return esp_wifi_connect();
+}
+
+esp_err_t idf_wifi_provision_connect(const std::string& ssid, const std::string& pass)
+{
+    if (!s_started.load(std::memory_order_relaxed)) return ESP_ERR_INVALID_STATE;
+    wifi_config_t sta_config = {};
+    strlcpy(reinterpret_cast<char*>(sta_config.sta.ssid), ssid.c_str(), sizeof(sta_config.sta.ssid));
+    strlcpy(reinterpret_cast<char*>(sta_config.sta.password), pass.c_str(), sizeof(sta_config.sta.password));
+    sta_config.sta.scan_method = WIFI_FAST_SCAN;
+    sta_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+    sta_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    // 保持 APSTA：配网页仍连在热点上，连上后由 IP 事件调度延时关热点(见 wifi_event_handler)
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (err != ESP_OK) return err;
+    esp_wifi_disconnect();  // 断开可能存在的旧 STA 连接，确保按新凭据重连
+    err = esp_wifi_set_config(WIFI_IF_STA, &sta_config);
+    if (err != ESP_OK) return err;
+    s_has_sta_credentials.store(!ssid.empty(), std::memory_order_relaxed);
+    s_sta_configured.store(true, std::memory_order_relaxed);
+    s_provisioning.store(true, std::memory_order_relaxed);
+    if (s_wifi_event_group) xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+    err = esp_wifi_connect();
+    ESP_LOGI(TAG, "配网：保存并连接 %s", ssid.c_str());
+    idf_logf("配网热点内保存 WiFi 并尝试连接: %s", ssid.c_str());
+    return err;
 }
 
 static void json_escape_append(std::string& out, const std::string& value)

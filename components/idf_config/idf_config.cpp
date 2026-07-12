@@ -4,6 +4,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
+#include <regex.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -146,10 +147,48 @@ static void limit_utf8_bytes(std::string& value, size_t max_len)
     value.resize(end);
 }
 
+static std::string trim_copy(const std::string& value);
+
+// mDNS 主机名规范化：只保留 DNS 标签合法字符(小写字母/数字/连字符)，大写转小写；
+// 容忍用户误填 http:// 前缀或 .local 后缀，自动剥离；结果为空回退默认 "sms"
+static void sanitize_mdns_host(std::string& host)
+{
+    std::string src = trim_copy(host);
+    if (src.rfind("http://", 0) == 0) src = src.substr(7);
+    else if (src.rfind("https://", 0) == 0) src = src.substr(8);
+    size_t dot = src.find('.');
+    if (dot != std::string::npos) src = src.substr(0, dot);
+    std::string out;
+    for (char ch : src) {
+        if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+        bool ok = (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-';
+        if (ok) out += ch;
+        if (out.size() >= 32) break;  // DNS 标签上限 63，收紧到 32 足够且省应答缓冲
+    }
+    while (!out.empty() && out.front() == '-') out.erase(out.begin());
+    while (!out.empty() && out.back() == '-') out.pop_back();
+    host = out.empty() ? "sms" : out;
+}
+
 static void normalize_config(IdfConfig& c)
 {
-    limit_utf8_bytes(c.wifiSsid, 64);
-    limit_utf8_bytes(c.wifiPass, 128);
+    // 历史 WiFi 列表：截断超长字段、去掉空槽/同名重复并前移，保持槽位连续
+    {
+        int w = 0;
+        for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+            limit_utf8_bytes(c.wifiNetworks[i].ssid, 64);
+            limit_utf8_bytes(c.wifiNetworks[i].pass, 128);
+            if (is_blank(c.wifiNetworks[i].ssid)) continue;
+            bool dup = false;
+            for (int j = 0; j < w; ++j) {
+                if (c.wifiNetworks[j].ssid == c.wifiNetworks[i].ssid) { dup = true; break; }
+            }
+            if (dup) continue;
+            if (w != i) c.wifiNetworks[w] = c.wifiNetworks[i];
+            ++w;
+        }
+        for (; w < IDF_MAX_WIFI_NETWORKS; ++w) c.wifiNetworks[w] = IdfWifiNetwork();
+    }
     limit_utf8_bytes(c.smtpServer, 128);
     c.smtpPort = (c.smtpPort > 0 && c.smtpPort <= 65535) ? c.smtpPort : 465;
     limit_utf8_bytes(c.smtpUser, 128);
@@ -172,6 +211,7 @@ static void normalize_config(IdfConfig& c)
 
     c.tzOffsetMin = clamp_int(c.tzOffsetMin, -720, 840);
     limit_utf8_bytes(c.ntpServer, 128);
+    sanitize_mdns_host(c.mdnsHost);
     c.rebootHour = clamp_int(c.rebootHour, 0, 23);
     c.hbHour = clamp_int(c.hbHour, 0, 23);
 
@@ -325,6 +365,94 @@ static void append_kv_u32(std::string& out, const char* key, uint32_t value)
     append_kv(out, key, buf);
 }
 
+static const char* redact_secret(const std::string& value)
+{
+    return value.empty() ? "" : "__REDACTED__";
+}
+
+static bool is_redacted_secret(const std::string& value)
+{
+    return value == "__REDACTED__";
+}
+
+// POSIX ERE 不认识 Perl 风格 \d \w \s；Arduino 版自研引擎支持这些转义，迁移前
+// 用户已存的转发规则依赖它们，先翻译成 POSIX 字符类再编译。
+// 保存时校验(本文件)与运行时匹配(idf_push)共用，保证两边语义一致。
+std::string idf_config_translate_perl_classes(const std::string& pattern)
+{
+    std::string out;
+    out.reserve(pattern.size() + 16);
+    bool in_bracket = false;
+    for (size_t i = 0; i < pattern.size(); ++i) {
+        char ch = pattern[i];
+        if (ch == '[' && !in_bracket) { in_bracket = true; out += ch; continue; }
+        if (ch == ']' && in_bracket) { in_bracket = false; out += ch; continue; }
+        if (ch != '\\' || i + 1 >= pattern.size()) { out += ch; continue; }
+        char next = pattern[i + 1];
+        const char* body = nullptr;
+        const char* neg = nullptr;
+        switch (next) {
+            case 'd': body = "0-9"; break;
+            case 'D': neg = "0-9"; break;
+            case 'w': body = "A-Za-z0-9_"; break;
+            case 'W': neg = "A-Za-z0-9_"; break;
+            case 's': body = " \t\r\n\f\v"; break;
+            case 'S': neg = " \t\r\n\f\v"; break;
+            default: out += ch; out += next; ++i; continue;
+        }
+        if (in_bracket) {
+            if (body) { out += body; ++i; }
+            else { out += ch; out += next; ++i; }
+        } else {
+            out += '[';
+            if (neg) { out += '^'; out += neg; }
+            else out += body;
+            out += ']';
+            ++i;
+        }
+    }
+    return out;
+}
+
+esp_err_t idf_config_validate_forward_rules(const std::string& rules, std::string* message)
+{
+    size_t pos = 0;
+    int line_no = 0;
+    while (pos < rules.size()) {
+        size_t end = rules.find('\n', pos);
+        if (end == std::string::npos) end = rules.size();
+        std::string line = trim_copy(rules.substr(pos, end - pos));
+        pos = end + (end < rules.size() ? 1 : 0);
+        ++line_no;
+        if (line.empty()) continue;
+
+        size_t t1 = line.find('\t');
+        size_t t2 = t1 == std::string::npos ? std::string::npos : line.find('\t', t1 + 1);
+        if (t1 == std::string::npos || t2 == std::string::npos) continue;
+        size_t t3 = line.find('\t', t2 + 1);
+        std::string type = line.substr(0, t1);
+        std::string pat = line.substr(t1 + 1, t2 - t1 - 1);
+        std::string enabled = t3 == std::string::npos ? "1" : trim_copy(line.substr(t3 + 1));
+        if (enabled == "0" || pat.empty() || type == "kw") continue;
+        if (type != "from" && type != "re") continue;
+
+        std::string posix = idf_config_translate_perl_classes(pat);
+        regex_t re = {};
+        int rc = regcomp(&re, posix.c_str(), REG_EXTENDED | REG_ICASE | REG_NOSUB);
+        if (rc != 0) {
+            if (message) {
+                char errbuf[96] = {};
+                regerror(rc, &re, errbuf, sizeof(errbuf));
+                *message = "第 " + std::to_string(line_no) + " 行正则无效: " + errbuf;
+            }
+            return ESP_ERR_INVALID_ARG;
+        }
+        regfree(&re);
+    }
+    if (message) message->clear();
+    return ESP_OK;
+}
+
 esp_err_t idf_config_load(void)
 {
     esp_err_t mutex_err = ensure_config_mutex();
@@ -338,14 +466,22 @@ esp_err_t idf_config_load(void)
         ESP_LOGW(TAG, "NVS 配置不存在，使用默认值");
         idf_log_line("NVS 配置不存在，使用默认值");
     } else if (err != ESP_OK) {
-        ESP_LOGE(TAG, "打开 NVS 配置失败: %s", esp_err_to_name(err));
-        idf_logf("打开 NVS 配置失败: %s", esp_err_to_name(err));
-        return err;
+        // 不提前返回：继续走默认值+编译期 WiFi 回退，至少保证设备能上网可救
+        ESP_LOGE(TAG, "打开 NVS 配置失败: %s，使用默认值", esp_err_to_name(err));
+        idf_logf("打开 NVS 配置失败: %s，使用默认值", esp_err_to_name(err));
     }
 
     if (err == ESP_OK) {
-        next.wifiSsid = read_str(nvs, "wifiSsid", "", 64);
-        next.wifiPass = read_str(nvs, "wifiPass", "", 128);
+        // 槽位 0 沿用旧键，其余槽位用 wifiNSsid/wifiNPass(N=1..4)，旧固件配置无缝升级
+        next.wifiNetworks[0].ssid = read_str(nvs, "wifiSsid", "", 64);
+        next.wifiNetworks[0].pass = read_str(nvs, "wifiPass", "", 128);
+        for (int i = 1; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+            char key[16];
+            snprintf(key, sizeof(key), "wifi%dSsid", i);
+            next.wifiNetworks[i].ssid = read_str(nvs, key, "", 64);
+            snprintf(key, sizeof(key), "wifi%dPass", i);
+            next.wifiNetworks[i].pass = read_str(nvs, key, "", 128);
+        }
         next.smtpServer = read_str(nvs, "smtpServer", "", 128);
         next.smtpPort = read_i32(nvs, "smtpPort", 465);
         next.smtpUser = read_str(nvs, "smtpUser", "", 128);
@@ -369,6 +505,7 @@ esp_err_t idf_config_load(void)
 
         next.tzOffsetMin = read_i32(nvs, "tzMin", 480);
         next.ntpServer = read_str(nvs, "ntpSrv", "ntp.aliyun.com", 128);
+        next.mdnsHost = read_str(nvs, "mdnsHost", "sms", 32);
         next.rebootEnabled = read_bool(nvs, "rbEn", false);
         next.rebootHour = read_i32(nvs, "rbHour", 4);
         next.hbEnabled = read_bool(nvs, "hbEn", false);
@@ -431,14 +568,27 @@ esp_err_t idf_config_load(void)
         nvs_close(nvs);
     }
 
-    if (next.wifiSsid.empty() && WIFI_SSID[0]) {
-        next.wifiSsid = WIFI_SSID;
-        next.wifiPass = WIFI_PASS;
+    bool has_any_wifi = false;
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        if (!is_blank(next.wifiNetworks[i].ssid)) { has_any_wifi = true; break; }
+    }
+    if (!has_any_wifi && WIFI_SSID[0]) {
+        next.wifiNetworks[0].ssid = WIFI_SSID;
+        next.wifiNetworks[0].pass = WIFI_PASS;
         next.wifiFromFallback = true;
     }
     normalize_config(next);
 
-    std::string log_wifi = next.wifiSsid;
+    std::string log_wifi = next.wifiNetworks[0].ssid;
+    int log_wifi_extra = 0;
+    for (int i = 1; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        if (!next.wifiNetworks[i].ssid.empty()) ++log_wifi_extra;
+    }
+    if (log_wifi_extra > 0) {
+        char extra[24];
+        snprintf(extra, sizeof(extra), " (+%d组备用)", log_wifi_extra);
+        log_wifi += extra;
+    }
     bool log_fallback = next.wifiFromFallback;
     std::string log_web_user = next.webUser;
     esp_err_t set_err = replace_config(next);
@@ -454,22 +604,30 @@ esp_err_t idf_config_load(void)
     return ESP_OK;
 }
 
-std::string idf_config_export_text(void)
+std::string idf_config_export_text(bool full_export)
 {
     IdfConfig c = idf_config_get();
     std::string out;
     out.reserve(4096);
 
-    append_kv(out, "wifiSsid", c.wifiSsid);
-    append_kv(out, "wifiPass", c.wifiPass);
+    // 槽位 0 用旧键名导出，旧固件也能导入最近配网的网络；其余槽位用 wifiNSsid/Pass
+    append_kv(out, "wifiSsid", c.wifiNetworks[0].ssid);
+    append_kv(out, "wifiPass", full_export ? c.wifiNetworks[0].pass : redact_secret(c.wifiNetworks[0].pass));
+    for (int i = 1; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        char key[16];
+        snprintf(key, sizeof(key), "wifi%dSsid", i);
+        append_kv(out, key, c.wifiNetworks[i].ssid);
+        snprintf(key, sizeof(key), "wifi%dPass", i);
+        append_kv(out, key, full_export ? c.wifiNetworks[i].pass : redact_secret(c.wifiNetworks[i].pass));
+    }
     append_kv(out, "smtpServer", c.smtpServer);
     append_kv_i(out, "smtpPort", c.smtpPort);
     append_kv(out, "smtpUser", c.smtpUser);
-    append_kv(out, "smtpPass", c.smtpPass);
+    append_kv(out, "smtpPass", full_export ? c.smtpPass : redact_secret(c.smtpPass));
     append_kv(out, "smtpSendTo", c.smtpSendTo);
     append_kv(out, "adminPhone", c.adminPhone);
     append_kv(out, "webUser", c.webUser);
-    append_kv(out, "webPass", c.webPass);
+    append_kv(out, "webPass", full_export ? c.webPass : redact_secret(c.webPass));
     append_kv(out, "numBlkList", c.numberBlackList);
     append_kv(out, "fwdRules", c.forwardRules);
     append_kv_i(out, "emailEnabled", c.emailEnabled ? 1 : 0);
@@ -477,6 +635,7 @@ std::string idf_config_export_text(void)
 
     append_kv_i(out, "tzOffsetMin", c.tzOffsetMin);
     append_kv(out, "ntpServer", c.ntpServer);
+    append_kv(out, "mdnsHost", c.mdnsHost);
     append_kv_i(out, "rebootEnabled", c.rebootEnabled ? 1 : 0);
     append_kv_i(out, "rebootHour", c.rebootHour);
     append_kv_i(out, "hbEnabled", c.hbEnabled ? 1 : 0);
@@ -506,15 +665,15 @@ std::string idf_config_export_text(void)
         snprintf(key, sizeof(key), "push%dtype", i);
         append_kv_i(out, key, ch.type);
         snprintf(key, sizeof(key), "push%durl", i);
-        append_kv(out, key, ch.url);
+        append_kv(out, key, full_export ? ch.url : redact_secret(ch.url));
         snprintf(key, sizeof(key), "push%dname", i);
         append_kv(out, key, ch.name);
         snprintf(key, sizeof(key), "push%dk1", i);
-        append_kv(out, key, ch.key1);
+        append_kv(out, key, full_export ? ch.key1 : redact_secret(ch.key1));
         snprintf(key, sizeof(key), "push%dk2", i);
-        append_kv(out, key, ch.key2);
+        append_kv(out, key, full_export ? ch.key2 : redact_secret(ch.key2));
         snprintf(key, sizeof(key), "push%dbody", i);
-        append_kv(out, key, ch.customBody);
+        append_kv(out, key, full_export ? ch.customBody : redact_secret(ch.customBody));
     }
 
     for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) {
@@ -544,22 +703,32 @@ std::string idf_config_export_text(void)
 
 static void apply_import_key(IdfConfig& c, const std::string& key, const std::string& value)
 {
-    if (key == "wifiSsid") c.wifiSsid = value;
-    else if (key == "wifiPass") c.wifiPass = value;
+    if (key == "wifiSsid") c.wifiNetworks[0].ssid = value;
+    else if (key == "wifiPass" && !is_redacted_secret(value)) c.wifiNetworks[0].pass = value;
+    else if (key.size() == 9 && key.rfind("wifi", 0) == 0 &&
+             isdigit(static_cast<unsigned char>(key[4]))) {
+        // wifi1Ssid / wifi1Pass … 备用槽位(脱敏导出的密码占位跳过，保留原值)
+        int idx = key[4] - '0';
+        if (idx < 1 || idx >= IDF_MAX_WIFI_NETWORKS) return;
+        std::string suffix = key.substr(5);
+        if (suffix == "Ssid") c.wifiNetworks[idx].ssid = value;
+        else if (suffix == "Pass" && !is_redacted_secret(value)) c.wifiNetworks[idx].pass = value;
+    }
     else if (key == "smtpServer") c.smtpServer = value;
     else if (key == "smtpPort") import_int_field(c.smtpPort, value);
     else if (key == "smtpUser") c.smtpUser = value;
-    else if (key == "smtpPass") c.smtpPass = value;
+    else if (key == "smtpPass" && !is_redacted_secret(value)) c.smtpPass = value;
     else if (key == "smtpSendTo") c.smtpSendTo = value;
     else if (key == "adminPhone") c.adminPhone = value;
     else if (key == "webUser" && !is_blank(value)) c.webUser = value;
-    else if (key == "webPass" && !is_blank(value)) c.webPass = value;
+    else if (key == "webPass" && !is_blank(value) && !is_redacted_secret(value)) c.webPass = value;
     else if (key == "numBlkList" || key == "numberBlackList") c.numberBlackList = value;
     else if (key == "fwdRules" || key == "forwardRules") c.forwardRules = value;
     else if (key == "emailEnabled") c.emailEnabled = bool_from_text(value);
     else if (key == "pushEnabled") c.pushEnabled = bool_from_text(value);
     else if (key == "tzOffsetMin") import_int_field(c.tzOffsetMin, value);
     else if (key == "ntpServer") c.ntpServer = value;
+    else if (key == "mdnsHost") c.mdnsHost = value;
     else if (key == "rebootEnabled") c.rebootEnabled = bool_from_text(value);
     else if (key == "rebootHour") import_int_field(c.rebootHour, value);
     else if (key == "hbEnabled") c.hbEnabled = bool_from_text(value);
@@ -607,11 +776,11 @@ static void apply_import_key(IdfConfig& c, const std::string& key, const std::st
         IdfPushChannel& ch = c.pushChannels[idx];
         if (suffix == "en") ch.enabled = bool_from_text(value);
         else if (suffix == "type") import_u8_field(ch.type, value);
-        else if (suffix == "url") ch.url = value;
+        else if (suffix == "url" && !is_redacted_secret(value)) ch.url = value;
         else if (suffix == "name") ch.name = value.empty() ? channel_default_name(idx) : value;
-        else if (suffix == "k1") ch.key1 = value;
-        else if (suffix == "k2") ch.key2 = value;
-        else if (suffix == "body") ch.customBody = value;
+        else if (suffix == "k1" && !is_redacted_secret(value)) ch.key1 = value;
+        else if (suffix == "k2" && !is_redacted_secret(value)) ch.key2 = value;
+        else if (suffix == "body" && !is_redacted_secret(value)) ch.customBody = value;
     }
 }
 
@@ -787,15 +956,29 @@ esp_err_t idf_config_set_call_notify_enabled(bool enabled)
     return err;
 }
 
+// 历史 WiFi 全槽位落盘：槽位 0 写旧键(OTA 回滚兼容)，其余写 wifiNSsid/wifiNPass
+static esp_err_t write_wifi_networks(nvs_handle_t nvs, const IdfWifiNetwork nets[IDF_MAX_WIFI_NETWORKS])
+{
+    esp_err_t err = write_str(nvs, "wifiSsid", nets[0].ssid);
+    if (err == ESP_OK) err = write_str(nvs, "wifiPass", nets[0].pass);
+    for (int i = 1; err == ESP_OK && i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        char key[16];
+        snprintf(key, sizeof(key), "wifi%dSsid", i);
+        err = write_str(nvs, key, nets[i].ssid);
+        if (err != ESP_OK) break;
+        snprintf(key, sizeof(key), "wifi%dPass", i);
+        err = write_str(nvs, key, nets[i].pass);
+    }
+    return err;
+}
+
 static esp_err_t save_config_to_nvs(const IdfConfig& c)
 {
     nvs_handle_t nvs = 0;
     esp_err_t err = nvs_open("sms_config", NVS_READWRITE, &nvs);
     if (err != ESP_OK) return err;
 
-    err = ESP_OK;
-    if (err == ESP_OK) err = write_str(nvs, "wifiSsid", c.wifiSsid);
-    if (err == ESP_OK) err = write_str(nvs, "wifiPass", c.wifiPass);
+    err = write_wifi_networks(nvs, c.wifiNetworks);
     if (err == ESP_OK) err = write_str(nvs, "smtpServer", c.smtpServer);
     if (err == ESP_OK) err = nvs_set_i32(nvs, "smtpPort", c.smtpPort);
     if (err == ESP_OK) err = write_str(nvs, "smtpUser", c.smtpUser);
@@ -819,6 +1002,7 @@ static esp_err_t save_config_to_nvs(const IdfConfig& c)
 
     if (err == ESP_OK) err = nvs_set_i32(nvs, "tzMin", c.tzOffsetMin);
     if (err == ESP_OK) err = write_str(nvs, "ntpSrv", c.ntpServer);
+    if (err == ESP_OK) err = write_str(nvs, "mdnsHost", c.mdnsHost);
     if (err == ESP_OK) err = nvs_set_u8(nvs, "rbEn", c.rebootEnabled ? 1 : 0);
     if (err == ESP_OK) err = nvs_set_i32(nvs, "rbHour", c.rebootHour);
     if (err == ESP_OK) err = nvs_set_u8(nvs, "hbEn", c.hbEnabled ? 1 : 0);
@@ -936,31 +1120,124 @@ static esp_err_t commit_config_update(IdfConfig& next, const IdfConfig& base)
 
 esp_err_t idf_config_save(void)
 {
-    IdfConfig base = idf_config_get();
-    IdfConfig next = base;
-    return commit_config_update(next, base);
+    esp_err_t err = ensure_config_mutex();
+    if (err != ESP_OK) return err;
+    // 快照必须在 persist 锁内取：锁外快照到提交之间完成的单字段保存会被整体回写覆盖
+    if (xSemaphoreTake(s_persist_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
+    IdfConfig next = idf_config_get();
+    normalize_config(next);
+    err = save_config_to_nvs(next);
+    if (err == ESP_OK) err = replace_config(next);
+    xSemaphoreGive(s_persist_mutex);
+    return err;
 }
 
 esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass)
 {
     if (ssid.empty() || ssid.size() > 32 || pass.size() > 64) return ESP_ERR_INVALID_ARG;
-    std::string next_ssid = ssid;
-    std::string next_pass = pass;
-    limit_utf8_bytes(next_ssid, 64);
-    limit_utf8_bytes(next_pass, 128);
 
     nvs_handle_t nvs = 0;
     esp_err_t err = begin_field_save(&nvs);
     if (err != ESP_OK) return err;
-    if (err == ESP_OK) err = write_str(nvs, "wifiSsid", next_ssid);
-    if (err == ESP_OK) err = write_str(nvs, "wifiPass", next_pass);
+
+    // 上位插入历史列表：同名网络更新密码并提到槽位 0，新网络插入槽位 0 其余后移，
+    // 满员时挤掉最旧一组。快照在 persist 锁内取，避免并发保存互相覆盖
+    IdfWifiNetwork nets[IDF_MAX_WIFI_NETWORKS];
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) nets[i] = s_config.wifiNetworks[i];
+    xSemaphoreGive(s_config_mutex);
+
+    int shift_from = IDF_MAX_WIFI_NETWORKS - 1;
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        if (nets[i].ssid == ssid) { shift_from = i; break; }
+    }
+    for (int i = shift_from; i > 0; --i) nets[i] = nets[i - 1];
+    nets[0].ssid = ssid;
+    nets[0].pass = pass;
+
+    err = write_wifi_networks(nvs, nets);
     err = commit_field_save(nvs, err, "WiFi 配置");
     if (err == ESP_OK) {
         xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-        s_config.wifiSsid = next_ssid;
-        s_config.wifiPass = next_pass;
+        for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) s_config.wifiNetworks[i] = nets[i];
         s_config.wifiFromFallback = false;
         xSemaphoreGive(s_config_mutex);
+    }
+    xSemaphoreGive(s_persist_mutex);
+    return err;
+}
+
+esp_err_t idf_config_note_wifi_connected(const std::string& ssid, const std::string& pass)
+{
+    if (ssid.empty() || ssid.size() > 32 || pass.size() > 64) return ESP_ERR_INVALID_ARG;
+    esp_err_t err = ensure_config_mutex();
+    if (err != ESP_OK) return err;
+
+    // 列表顺序即"最近使用"序：已在首位(常驻网络重连的常态)直接返回零开销；
+    // 在列表但不在首位 → 提到首位，满员时挤掉的末位自然是最久未用的一组(LRU)。
+    // 只有真正换网/新网络才触发落盘，且 NVS 对值未变化的键会跳过实际写入
+    int found = -1;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        if (s_config.wifiNetworks[i].ssid == ssid && s_config.wifiNetworks[i].pass == pass) {
+            found = i;
+            break;
+        }
+    }
+    xSemaphoreGive(s_config_mutex);
+    if (found == 0) return ESP_OK;
+
+    err = idf_config_save_wifi(ssid, pass);
+    if (err == ESP_OK && found < 0) idf_logf("已连接新网络，自动加入历史 WiFi: %s", ssid.c_str());
+    return err;
+}
+
+esp_err_t idf_config_save_wifi_networks(const IdfWifiNetwork nets_in[IDF_MAX_WIFI_NETWORKS],
+                                        bool preserve_blank_pass)
+{
+    // 先校验整表再落盘，避免半程失败留下部分槽位
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        if (is_blank(nets_in[i].ssid)) continue;
+        if (nets_in[i].ssid.size() > 32 || nets_in[i].pass.size() > 64) return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t nvs = 0;
+    esp_err_t err = begin_field_save(&nvs);
+    if (err != ESP_OK) return err;
+
+    // 压实：跳过空槽/同名重复；已存网络密码留空表示保持原密码(与 SMTP 密码同语义)，
+    // 新网络密码留空则按开放网络保存
+    IdfWifiNetwork nets[IDF_MAX_WIFI_NETWORKS];
+    int w = 0;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        if (is_blank(nets_in[i].ssid)) continue;
+        bool dup = false;
+        for (int j = 0; j < w; ++j) {
+            if (nets[j].ssid == nets_in[i].ssid) { dup = true; break; }
+        }
+        if (dup) continue;
+        nets[w] = nets_in[i];
+        if (preserve_blank_pass && nets[w].pass.empty()) {
+            for (int j = 0; j < IDF_MAX_WIFI_NETWORKS; ++j) {
+                if (s_config.wifiNetworks[j].ssid == nets[w].ssid) {
+                    nets[w].pass = s_config.wifiNetworks[j].pass;
+                    break;
+                }
+            }
+        }
+        ++w;
+    }
+    xSemaphoreGive(s_config_mutex);
+
+    err = write_wifi_networks(nvs, nets);
+    err = commit_field_save(nvs, err, "WiFi 网络列表");
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) s_config.wifiNetworks[i] = nets[i];
+        if (w > 0) s_config.wifiFromFallback = false;
+        xSemaphoreGive(s_config_mutex);
+        if (w == 0) idf_log_line("WiFi 列表已清空，重启后将进入配网热点");
     }
     xSemaphoreGive(s_persist_mutex);
     return err;
@@ -1018,6 +1295,26 @@ esp_err_t idf_config_save_time(int tz_offset_min, const std::string& ntp_server)
         s_config.tzOffsetMin = next_tz;
         s_config.ntpServer = next_ntp;
         xSemaphoreGive(s_config_mutex);
+    }
+    xSemaphoreGive(s_persist_mutex);
+    return err;
+}
+
+esp_err_t idf_config_save_mdns_host(const std::string& host)
+{
+    std::string next_host = host;
+    sanitize_mdns_host(next_host);
+
+    nvs_handle_t nvs = 0;
+    esp_err_t err = begin_field_save(&nvs);
+    if (err != ESP_OK) return err;
+    err = write_str(nvs, "mdnsHost", next_host);
+    err = commit_field_save(nvs, err, "mDNS 主机名");
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        s_config.mdnsHost = next_host;
+        xSemaphoreGive(s_config_mutex);
+        idf_logf("mDNS 主机名已保存: http://%s.local", next_host.c_str());
     }
     xSemaphoreGive(s_persist_mutex);
     return err;
@@ -1160,6 +1457,8 @@ esp_err_t idf_config_save_forward_rules(const std::string& rules)
 {
     std::string next_rules = rules;
     limit_utf8_bytes(next_rules, 2048);
+    esp_err_t valid = idf_config_validate_forward_rules(next_rules, nullptr);
+    if (valid != ESP_OK) return valid;
 
     nvs_handle_t nvs = 0;
     esp_err_t err = begin_field_save(&nvs);
@@ -1397,6 +1696,7 @@ IdfConfigWebView idf_config_get_web_view(void)
     view.emailEnabled = s_config.emailEnabled;
     view.pushEnabled = s_config.pushEnabled;
     view.ntpServer = s_config.ntpServer;
+    view.mdnsHost = s_config.mdnsHost;
     view.tzOffsetMin = s_config.tzOffsetMin;
     view.rebootEnabled = s_config.rebootEnabled;
     view.rebootHour = s_config.rebootHour;
@@ -1410,6 +1710,10 @@ IdfConfigWebView idf_config_get_web_view(void)
     view.kaProfile = s_config.kaProfile;
     view.netLedEnabled = s_config.netLedEnabled;
     view.callNotifyEnabled = s_config.callNotifyEnabled;
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        view.wifiNetworks[i].ssid = s_config.wifiNetworks[i].ssid;
+        view.wifiNetworks[i].passSet = !s_config.wifiNetworks[i].pass.empty();
+    }
     view.emailConfigured = email_configured_locked();
     for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
         view.pushChannels[i] = s_config.pushChannels[i];
@@ -1585,11 +1889,37 @@ bool idf_config_get_push_channel(uint8_t channel, IdfPushChannel& out)
 // 在每个 HTTP 请求上都做一次会造成持续的堆分配抖动与碎片化
 bool idf_config_has_sta_credentials(void)
 {
+    // normalize 保证列表连续，槽位 0 非空即代表有可用凭据
     if (ensure_config_mutex() != ESP_OK) return false;
     xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-    bool ok = !s_config.wifiSsid.empty();
+    bool ok = !s_config.wifiNetworks[0].ssid.empty();
     xSemaphoreGive(s_config_mutex);
     return ok;
+}
+
+std::vector<IdfWifiNetwork> idf_config_get_wifi_networks(void)
+{
+    std::vector<IdfWifiNetwork> nets;
+    if (ensure_config_mutex() != ESP_OK) return nets;
+    nets.reserve(IDF_MAX_WIFI_NETWORKS);
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        if (!s_config.wifiNetworks[i].ssid.empty()) nets.push_back(s_config.wifiNetworks[i]);
+    }
+    xSemaphoreGive(s_config_mutex);
+    return nets;
+}
+
+int idf_config_wifi_network_count(void)
+{
+    if (ensure_config_mutex() != ESP_OK) return 0;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    int count = 0;
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        if (!s_config.wifiNetworks[i].ssid.empty()) ++count;
+    }
+    xSemaphoreGive(s_config_mutex);
+    return count;
 }
 
 bool idf_config_net_led_enabled(void)
@@ -1631,6 +1961,20 @@ std::string idf_config_get_ntp_server(void)
     return server;
 }
 
+void idf_config_copy_mdns_host(char* out, size_t cap)
+{
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    if (ensure_config_mutex() != ESP_OK) {
+        snprintf(out, cap, "sms");
+        return;
+    }
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    snprintf(out, cap, "%s", s_config.mdnsHost.c_str());
+    xSemaphoreGive(s_config_mutex);
+    if (out[0] == '\0') snprintf(out, cap, "sms");
+}
+
 bool idf_config_email_configured(void)
 {
     if (ensure_config_mutex() != ESP_OK) return false;
@@ -1649,12 +1993,25 @@ int idf_config_enabled_push_count(void)
     return count;
 }
 
+// 常数时间比对：逐字节累积差异，不因首字节不匹配提前返回，避免计时侧信道
+static bool timing_safe_equals(const std::string& expected, const char* actual)
+{
+    size_t actual_len = strlen(actual);
+    unsigned char diff = (expected.size() == actual_len) ? 0 : 1;
+    for (size_t i = 0; i < expected.size(); ++i) {
+        unsigned char b = actual_len ? static_cast<unsigned char>(actual[i % actual_len]) : 0;
+        diff |= static_cast<unsigned char>(expected[i]) ^ b;
+    }
+    return diff == 0;
+}
+
 bool idf_config_check_web_auth(const char* user, const char* pass)
 {
     if (!user || !pass) return false;
     if (ensure_config_mutex() != ESP_OK) return false;
     xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-    bool ok = (s_config.webUser == user) && (s_config.webPass == pass);
+    bool user_ok = timing_safe_equals(s_config.webUser, user);
+    bool pass_ok = timing_safe_equals(s_config.webPass, pass);
     xSemaphoreGive(s_config_mutex);
-    return ok;
+    return user_ok && pass_ok;
 }

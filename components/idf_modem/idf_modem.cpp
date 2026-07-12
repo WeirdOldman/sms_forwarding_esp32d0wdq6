@@ -69,6 +69,7 @@ static int s_logged_rsrp = 999;
 static int s_logged_rsrq = 999;
 static int s_logged_sinr = 999;
 static bool s_logged_detail_valid = false;
+static std::atomic<int> s_logged_sms_storage_code{-1};  // -1=未知，0=MT，1=ME，2=SM
 static bool s_identity_static_attempted = false;
 static bool s_identity_network_attempted = false;
 static std::atomic<int64_t> s_last_web_poll_us{-WEB_POLL_ACTIVE_WINDOW_US};
@@ -519,7 +520,10 @@ esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::st
         }
     }
     if (response.find("+CMT:") != std::string::npos ||
-        response.find("+CMTI:") != std::string::npos) {
+        response.find("+CMTI:") != std::string::npos ||
+        response.find("+CLIP:") != std::string::npos ||
+        response.find("RING") != std::string::npos) {
+        // RING/+CLIP 也要保留：否则整段响铃落在一次持锁 AT 交换内时来电通知丢失
         append_urc_text(response);
     }
     xSemaphoreGive(s_at_mutex);
@@ -560,7 +564,10 @@ esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uin
         }
     }
     if (response.find("+CMT:") != std::string::npos ||
-        response.find("+CMTI:") != std::string::npos) {
+        response.find("+CMTI:") != std::string::npos ||
+        response.find("+CLIP:") != std::string::npos ||
+        response.find("RING") != std::string::npos) {
+        // RING/+CLIP 也要保留：否则整段响铃落在一次持锁 AT 交换内时来电通知丢失
         append_urc_text(response);
     }
     xSemaphoreGive(s_at_mutex);
@@ -629,7 +636,10 @@ esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint3
     }
 
     if (response.find("+CMT:") != std::string::npos ||
-        response.find("+CMTI:") != std::string::npos) {
+        response.find("+CMTI:") != std::string::npos ||
+        response.find("+CLIP:") != std::string::npos ||
+        response.find("RING") != std::string::npos) {
+        // RING/+CLIP 也要保留：否则整段响铃落在一次持锁 AT 交换内时来电通知丢失
         append_urc_text(response);
     }
     xSemaphoreGive(s_at_mutex);
@@ -830,7 +840,10 @@ static void append_no_cache_query(std::string& path)
 static void preserve_sms_urc_from_response(const std::string& response)
 {
     if (response.find("+CMT:") != std::string::npos ||
-        response.find("+CMTI:") != std::string::npos) {
+        response.find("+CMTI:") != std::string::npos ||
+        response.find("+CLIP:") != std::string::npos ||
+        response.find("RING") != std::string::npos) {
+        // RING/+CLIP 也要保留：否则整段响铃落在一次持锁 AT 交换内时来电通知丢失
         append_urc_text(response);
     }
 }
@@ -985,6 +998,10 @@ static bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms, IdfCell
                     } else if (append_next_sms_payload || starts_with(line, "+CMT:") || starts_with(line, "+CMTI:")) {
                         append_sms_urc_line(line);
                         append_next_sms_payload = starts_with(line, "+CMT:");
+                    } else if (line == "RING" || starts_with(line, "+CLIP:")) {
+                        // 保号下载最长可占用 UART ~90s，整段响铃都可能落在窗口内；
+                        // 不转发这两类行来电通知就静默丢了
+                        append_sms_urc_line(line);
                     }
                 }
                 head.clear();
@@ -1675,15 +1692,92 @@ static bool modem_quick_start_allowed(esp_reset_reason_t reason)
     }
 }
 
+// 解析 AT+CPMS 设置命令的响应 "+CPMS: <used1>,<total1>,<used2>,<total2>,<used3>,<total3>"，
+// 输出 <mem1> 总容量。查询响应(+CPMS: "SM",0,0,...)带引号存储名会解析失败，恰好只匹配设置响应。
+static bool parse_cpms_total(const std::string& resp, long& total)
+{
+    size_t p = resp.find("+CPMS:");
+    if (p == std::string::npos) return false;
+    std::string line = line_containing(resp, p);
+    const char* token = strstr(line.c_str(), "+CPMS:");
+    if (!token) return false;
+    long values[6] = {};
+    int count = 0;
+    if (!parse_comma_longs(token + strlen("+CPMS:"), values, 6, count) || count < 2) return false;
+    total = values[1];
+    return true;
+}
+
+static int sms_storage_code(const char* name)
+{
+    if (strcmp(name, "MT") == 0) return 0;
+    if (strcmp(name, "ME") == 0) return 1;
+    if (strcmp(name, "SM") == 0) return 2;
+    return -1;
+}
+
+static void log_sms_storage_if_changed(const char* name)
+{
+    int current = sms_storage_code(name);
+    int previous = s_logged_sms_storage_code.exchange(current, std::memory_order_relaxed);
+    if (previous == current) return;
+    // 首次 MT 是常规路径不提示；非 MT 或后续类型变化才记录，避免周期性 CPMS 重申刷屏。
+    if (previous != -1 || current != 0) idf_logf("短信存储使用 %s", name);
+}
+
+// 按优先级选择短信存储：MT → ME → SM。部分可写 eSIM 的 SM 存储返回 OK 但容量为
+// 0,0(issue #3)，此时短信实际无处可存，必须视为不可用并继续尝试下一候选；
+// 响应里解析不出容量的按可用处理(不同固件设置命令可能只回 OK)。
+static bool select_sms_storage(void)
+{
+    static const struct { const char* cmd; const char* name; } kCandidates[] = {
+        {"AT+CPMS=\"MT\",\"MT\",\"MT\"", "MT"},
+        {"AT+CPMS=\"ME\",\"ME\",\"ME\"", "ME"},
+        {"AT+CPMS=\"SM\",\"SM\",\"SM\"", "SM"},
+    };
+    for (const auto& c : kCandidates) {
+        std::string resp;
+        if (!send_ok(c.cmd, 1500, &resp)) continue;
+        long total = -1;
+        if (parse_cpms_total(resp, total) && total <= 0) {
+            idf_logf("短信存储 %s 容量为 0，尝试下一候选", c.name);
+            continue;
+        }
+        log_sms_storage_if_changed(c.name);
+        return true;
+    }
+    idf_log_line("警告: 无可用短信存储(MT/ME/SM 均不可用)，短信接收可能失败");
+    return false;
+}
+
+// 存储选择失败待补跑标志：冷启动时 CPMS 早于 SIM 就绪执行，SIM 初始化慢的开机
+// 可能三个候选全失败(SIM busy)。注册成功意味着 SIM 必已就绪，届时补跑一次。
+// 只在 modem_task 上下文读写，无需原子量。
+static bool s_sms_storage_pending = false;
+
+static void retry_sms_storage_if_pending(void)
+{
+    if (!s_sms_storage_pending) return;
+    idf_log_line("SIM 已就绪，补跑短信存储选择");
+    s_sms_storage_pending = !select_sms_storage();
+}
+
+void idf_modem_reassert_sms_storage(void)
+{
+    // 供短信任务周期性重申：模组自发复位(未被 ESP 侧察觉)后 CPMS 会回落到固件
+    // 默认存储(常为 SM)；SM 容量为 0 的 eSIM 上短信从此无处可存，接收静默死亡，
+    // 而 AT 探测/发送一切正常——"先能收后失效"的典型固件侧成因。
+    // select_sms_storage 内部走加锁的 AT 通道，跨任务调用安全。
+    select_sms_storage();
+}
+
 static void configure_sms_and_registration(void)
 {
     send_ok("ATE0", 1000);
     send_ok("AT+CMGF=0", 1200);
     // 统一收/存/读的短信存储位置：CNMI mt=1 投递到 <mem3>，CMGL/CMGR 读 <mem1>，
-    // 两者不一致时 +CMTI 索引和补收轮询会看不同的存储，短信被静默丢失(对齐 Arduino)
-    if (!send_ok("AT+CPMS=\"MT\",\"MT\",\"MT\"", 1500)) {
-        send_ok("AT+CPMS=\"SM\",\"SM\",\"SM\"", 1500);
-    }
+    // 两者不一致时 +CMTI 索引和补收轮询会看不同的存储，短信被静默丢失
+    s_sms_storage_pending = !select_sms_storage();
     send_ok("AT+CNMI=2,1,0,0,0", 1200);
     send_ok("AT+CEREG=2", 1200);
     // 开启主叫号码上报：来电时模组主动上报 RING + +CLIP: "号码",...，供来电通知使用。
@@ -1848,6 +1942,7 @@ static void modem_task(void*)
     if (!registered) {
         set_phase("failed");
     } else {
+        retry_sms_storage_if_pending();
         IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
         apply_operator_if_configured(cfg);
         if (cfg.dataEnabled) sample_cell_ip_once();
@@ -1925,6 +2020,9 @@ static void modem_task(void*)
                     dereg_count = 0;
                     if (!post_register_done) {
                         // 迟到/恢复的注册也要补跑必须的网络配置和首页基础信息。
+                        // 掉网后恢复可能意味着模组自发复位过：存储选择无条件重跑，
+                        // 不能只看 pending 标志(初次成功后它恒为 false)
+                        s_sms_storage_pending = !select_sms_storage();
                         IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
                         apply_operator_if_configured(cfg);
                         if (cfg.dataEnabled) sample_cell_ip_once();
@@ -2099,6 +2197,13 @@ void idf_modem_request_status_sample(void)
     s_status_sample_requests.fetch_add(1, std::memory_order_relaxed);
 }
 
+static std::atomic<void (*)(void)> s_sim_identity_hook{nullptr};
+
+void idf_modem_set_sim_identity_hook(void (*hook)(void))
+{
+    s_sim_identity_hook.store(hook, std::memory_order_relaxed);
+}
+
 void idf_modem_invalidate_sim_identity(void)
 {
     // 清除随卡变化的身份字段：切/启/禁 eSIM Profile 后当前生效的卡已不同，
@@ -2115,6 +2220,9 @@ void idf_modem_invalidate_sim_identity(void)
     // 复位采样"已尝试"标志，让网络字段(运营商/号码)重新查询；静态字段(型号/IMEI)非空仍跳过
     reset_identity_sampling_state();
     idf_modem_request_status_sample();
+    // 通知上层(idf_esim)：热插拔换卡后 EID 等缓存也要失效
+    void (*hook)(void) = s_sim_identity_hook.load(std::memory_order_relaxed);
+    if (hook) hook();
 }
 
 void idf_modem_power_off_for_restart(void)

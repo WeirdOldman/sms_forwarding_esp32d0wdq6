@@ -4,7 +4,7 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 ## What This Is
 
-ESP32-C3 firmware for a low-cost SMS forwarder. A 4G/LTE modem (ML307R-DC) receives SMS over UART/AT; the ESP32-C3 decodes PDU, then forwards the message over WiFi to email (SMTP) and up to 5 simultaneous push channels, and serves a web UI for config/diagnostics.
+Classic ESP32 / ESP32-D0WDQ6 firmware for a low-cost SMS forwarder. An ML307R-DC 4G/LTE modem receives SMS over UART/AT; the ESP32 decodes PDU, then forwards the message over WiFi to email (SMTP) and up to 5 simultaneous push channels, and serves a web UI for config/diagnostics.
 
 The firmware is now native **ESP-IDF only**. The former Arduino fallback sketch has been removed. Keep inline docs/comments in Chinese when editing source files.
 
@@ -30,6 +30,8 @@ python tools\build_web_assets.py --check
 ```
 
 CI builds the ESP-IDF firmware via `.github/workflows/build.yml`.
+
+This fork tracks `MineSunshineone/sms_forwarding` while keeping one classic ESP32 hardware profile: target `esp32`, UART1 TX/RX on GPIO17/GPIO16, modem EN on GPIO27, and the provisioning button on GPIO32. Do not restore ESP32-C3 pins or bootloader offsets when syncing upstream.
 
 ## Architecture
 
