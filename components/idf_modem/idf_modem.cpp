@@ -228,23 +228,12 @@ static std::string first_digit_run(const std::string& resp, size_t min_len, size
 
 static bool is_iccid_text(const std::string& value)
 {
+    // ML307R-DC may expose the EF_ICCID nibbles verbatim, including A-E values.
     if (value.size() < 15 || value.size() > 22) return false;
-    bool seen_digit = false;
-    bool padding = false;
-    uint8_t padding_count = 0;
     for (char ch : value) {
-        if (isdigit(static_cast<unsigned char>(ch))) {
-            if (padding) return false;
-            seen_digit = true;
-        } else if (ch == 'F' || ch == 'f') {
-            if (!seen_digit) return false;
-            padding = true;
-            if (++padding_count > 1) return false;
-        } else {
-            return false;
-        }
+        if (!isxdigit(static_cast<unsigned char>(ch))) return false;
     }
-    return seen_digit;
+    return true;
 }
 
 static bool is_imei_text(const std::string& value)
@@ -346,7 +335,6 @@ static bool startup_info_complete(void)
                    !s_status.model.empty() &&
                    !s_status.fwver.empty() &&
                    is_imei_text(s_status.imei) &&
-                   is_iccid_text(s_status.iccid) &&
                    is_imsi_text(s_status.imsi) &&
                    !s_status.operatorName.empty() &&
                    s_identity_network_attempted;
@@ -1050,14 +1038,21 @@ static bool parse_cgpaddr_ip(const std::string& resp, std::string& ip)
 {
     size_t p = resp.find("+CGPADDR:");
     if (p == std::string::npos) return false;
-    size_t comma = resp.find(',', p);
     size_t eol = resp.find('\n', p);
     if (eol == std::string::npos) eol = resp.size();
-    if (comma == std::string::npos || comma >= eol) return false;
-    ip = trim(resp.substr(comma + 1, eol - comma - 1));
-    ip.erase(std::remove(ip.begin(), ip.end(), '"'), ip.end());
-    if (!valid_ipv4_address(ip)) return false;
-    return true;
+    size_t field = resp.find(',', p);
+    while (field != std::string::npos && field < eol) {
+        size_t next = resp.find(',', field + 1);
+        if (next == std::string::npos || next > eol) next = eol;
+        std::string candidate = trim(resp.substr(field + 1, next - field - 1));
+        candidate.erase(std::remove(candidate.begin(), candidate.end(), '"'), candidate.end());
+        if (valid_ipv4_address(candidate)) {
+            ip = candidate;
+            return true;
+        }
+        field = next < eol ? next : std::string::npos;
+    }
+    return false;
 }
 
 static bool apn_valid_for_at(const std::string& apn)
@@ -1550,7 +1545,7 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
         std::string value = trim(p == std::string::npos ? line : line.substr(p + 1));
         value.erase(std::remove(value.begin(), value.end(), '"'), value.end());
         for (char& ch : value) {
-            if (ch == 'f') ch = 'F';
+            ch = static_cast<char>(toupper(static_cast<unsigned char>(ch)));
         }
         return is_iccid_text(value) ? value : std::string();
     };

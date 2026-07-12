@@ -43,6 +43,7 @@ static constexpr uint32_t SMS_POLL_INTERVAL_MS = 60000;
 static constexpr uint32_t SMS_STARTUP_POLL_INTERVAL_MS = 8000;
 static constexpr uint32_t SMS_STARTUP_FAST_WINDOW_MS = 120000;
 static constexpr uint8_t SMS_CNMI_REASSERT_EVERY = 5;
+static constexpr uint32_t SMS_SEND_TIMEOUT_MS = 60000;
 
 struct ConcatPart {
     bool valid = false;
@@ -1244,16 +1245,19 @@ esp_err_t idf_sms_send_text(const std::string& phone_raw, const std::string& tex
         char cmd[32];
         snprintf(cmd, sizeof(cmd), "AT+CMGS=%d", pdu_len);
         std::string resp;
-        err = idf_modem_send_pdu(cmd, sms_pdu.c_str(), 20000, resp);
+        err = idf_modem_send_pdu(cmd, sms_pdu.c_str(), SMS_SEND_TIMEOUT_MS, resp);
         if (err != ESP_OK) {
+            std::string failure = err == ESP_ERR_TIMEOUT
+                ? "短信发送响应超时"
+                : (resp.empty() ? std::string(esp_err_to_name(err)) : trim(resp));
             if (parts.size() > 1) {
                 char buf[96];
                 snprintf(buf, sizeof(buf), "长短信第 %u/%u 段发送失败: %s",
                          static_cast<unsigned>(i + 1), static_cast<unsigned>(parts.size()),
-                         resp.empty() ? esp_err_to_name(err) : trim(resp).c_str());
+                         failure.c_str());
                 message = buf;
             } else {
-                message = resp.empty() ? std::string(esp_err_to_name(err)) : trim(resp);
+                message = failure;
             }
             idf_sent_add(phone.c_str(), text.c_str(), false);
             idf_logf("网页发送短信失败: %s", message.c_str());
