@@ -39,9 +39,10 @@ static constexpr uint32_t CELLULAR_KEEPALIVE_MIN_BYTES = 48UL * 1024UL;
 static constexpr uint32_t CELLULAR_HTTP_TIMEOUT_MS = 90000UL;
 static constexpr uint32_t CELLULAR_PDP_READY_TIMEOUT_MS = 12000UL;
 static constexpr uint32_t MODEM_SIM_CONFIG_RETRY_GAP_MS = 10000UL;
+static constexpr uint32_t MODEM_REINIT_RETRY_GAP_MS = 5000UL;
 static constexpr uint32_t IDENTITY_RETRY_INTERVAL_MS = 600000UL;
-// 用户显式刷新概览模组信息后才做展示型采样：启动期不主动读取身份/信号；
-// 采样仍受 at_channel_idle 门控，不与收发/保号抢 AT 通道
+// AT 就绪后立即读取静态/SIM身份；信号和运营商等网络字段仍在注册后或网页刷新时采样。
+// 后续采样受 at_channel_idle 门控，不与收发/保号抢 AT 通道。
 static constexpr uint32_t SIGNAL_INTERVAL_WEB_MS = 10000UL;
 static constexpr uint32_t SIGNAL_DETAIL_INTERVAL_WEB_MS = 30000UL;
 static constexpr uint32_t SIM_CHECK_INTERVAL_MS = 15000UL;  // SIM 热插拔检测轮询间隔
@@ -63,6 +64,7 @@ static constexpr uint32_t SIM_APPLY_OPERATOR = 1u << 0;
 static constexpr uint32_t SIM_APPLY_DATA = 1u << 1;
 static std::atomic<uint32_t> s_sim_config_apply_pending{0};
 static std::atomic<bool> s_sim_config_apply_urgent{false};
+static std::atomic<bool> s_modem_ready_urc_pending{false};
 static TickType_t s_next_sim_config_apply = 0;
 static uint32_t s_sim_config_apply_failures = 0;
 static int s_logged_csq = -1;
@@ -177,6 +179,20 @@ static std::string line_containing(const std::string& resp, size_t pos)
     return line.substr(s, e - s);
 }
 
+static void observe_modem_ready_urc(const std::string& text)
+{
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t end = text.find('\n', pos);
+        if (end == std::string::npos) end = text.size();
+        if (trim(text.substr(pos, end - pos)) == "+MATREADY") {
+            s_modem_ready_urc_pending.store(true, std::memory_order_relaxed);
+            return;
+        }
+        pos = end + 1;
+    }
+}
+
 static bool line_is_payload(const std::string& line, const char* cmd)
 {
     if (line.empty() || line == "OK" || line == "ERROR") return false;
@@ -184,14 +200,16 @@ static bool line_is_payload(const std::string& line, const char* cmd)
     return true;
 }
 
-static std::string first_payload_line(const std::string& resp, const char* cmd = nullptr)
+static std::string first_plain_payload_line(const std::string& resp, const char* cmd = nullptr)
 {
     size_t pos = 0;
     while (pos < resp.size()) {
         size_t end = resp.find('\n', pos);
         if (end == std::string::npos) end = resp.size();
         std::string line = trim(resp.substr(pos, end - pos));
-        if (line_is_payload(line, cmd)) return line;
+        // CGMI/CGMM/CGMR 的有效载荷都是普通文本。复位完成 URC(+MATREADY)
+        // 或注册 URC 可能与查询响应同帧到达，不能把任何 "+..." 行当静态信息。
+        if (line_is_payload(line, cmd) && line.front() != '+') return line;
         pos = end + 1;
     }
     return {};
@@ -443,7 +461,10 @@ static void capture_pending_uart_locked(uint32_t max_ms)
             quiet.restart(40);
         }
     } while (!quiet.expired() && !hard_deadline.expired());
-    if (!pending.empty()) append_urc_text(pending);
+    if (!pending.empty()) {
+        observe_modem_ready_urc(pending);
+        append_urc_text(pending);
+    }
 }
 
 // 返回是否成功抢到 AT 通道锁并完成抓取；false=通道正被长任务占用
@@ -509,6 +530,7 @@ esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::st
             if (scan.size() > 32) scan.erase(0, scan.size() - 32);
         }
     }
+    observe_modem_ready_urc(response);
     if (response.find("+CMT:") != std::string::npos ||
         response.find("+CMTI:") != std::string::npos ||
         response.find("+CLIP:") != std::string::npos ||
@@ -553,6 +575,7 @@ esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uin
             if (scan.size() > 64) scan.erase(0, scan.size() - 64);
         }
     }
+    observe_modem_ready_urc(response);
     if (response.find("+CMT:") != std::string::npos ||
         response.find("+CMTI:") != std::string::npos ||
         response.find("+CLIP:") != std::string::npos ||
@@ -625,6 +648,7 @@ esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint3
         }
     }
 
+    observe_modem_ready_urc(response);
     if (response.find("+CMT:") != std::string::npos ||
         response.find("+CMTI:") != std::string::npos ||
         response.find("+CLIP:") != std::string::npos ||
@@ -670,30 +694,62 @@ static const char* format_ber(int ber, char* buf, size_t len)
 
 static bool parse_cereg(const std::string& resp, int& stat)
 {
-    size_t p = resp.find("+CEREG:");
-    if (p == std::string::npos) return false;
-    std::string line = line_containing(resp, p);
-    const char* token = strstr(line.c_str(), "+CEREG:");
-    if (!token) return false;
-    std::string rest = token + strlen("+CEREG:");
-    size_t comma = rest.find(',');
-    std::string first = trim(rest.substr(0, comma));
-    long first_value = -1;
-    if (!parse_long_token(first, first_value)) return false;
+    bool found = false;
+    bool found_query_response = false;
+    size_t pos = 0;
+    while ((pos = resp.find("+CEREG:", pos)) != std::string::npos) {
+        std::string line = line_containing(resp, pos);
+        const char* token = strstr(line.c_str(), "+CEREG:");
+        pos += strlen("+CEREG:");
+        if (!token) continue;
 
-    long status_value = first_value;
-    if (comma != std::string::npos) {
-        size_t second_end = rest.find(',', comma + 1);
-        std::string second = trim(rest.substr(
-            comma + 1, second_end == std::string::npos ? std::string::npos : second_end - comma - 1));
-        long second_value = -1;
-        // 查询响应是 +CEREG: <n>,<stat>；URC 是 +CEREG: <stat>[,<tac>,...]，
-        // 后者第二字段通常是带引号的 TAC，不能把它当注册状态。
-        if (parse_long_token(second, second_value)) status_value = second_value;
+        std::string rest = token + strlen("+CEREG:");
+        size_t comma = rest.find(',');
+        long first_value = -1;
+        if (!parse_long_token(trim(rest.substr(0, comma)), first_value)) continue;
+
+        bool query_response = false;
+        long status_value = first_value;
+        if (comma != std::string::npos) {
+            size_t second_end = rest.find(',', comma + 1);
+            std::string second = trim(rest.substr(
+                comma + 1, second_end == std::string::npos ? std::string::npos : second_end - comma - 1));
+            long second_value = -1;
+            // 查询响应是 +CEREG: <n>,<stat>；URC 的第二字段是带引号的 TAC。
+            if (parse_long_token(second, second_value) && second_value >= 0 && second_value <= 5) {
+                query_response = true;
+                status_value = second_value;
+            }
+        }
+        if (status_value < 0 || status_value > 5) continue;
+        // 同一响应中可能先收到旧 URC、后收到 AT+CEREG? 的查询结果；查询结果优先。
+        if (query_response || !found_query_response) {
+            stat = static_cast<int>(status_value);
+            found = true;
+            found_query_response = found_query_response || query_response;
+        }
     }
-    if (status_value < 0 || status_value > 5) return false;
-    stat = static_cast<int>(status_value);
-    return true;
+    return found;
+}
+
+static bool parse_cops_selection(const std::string& resp, int& mode, std::string& selected_operator)
+{
+    bool found = false;
+    size_t pos = 0;
+    while ((pos = resp.find("+COPS:", pos)) != std::string::npos) {
+        std::string line = line_containing(resp, pos);
+        const char* token = strstr(line.c_str(), "+COPS:");
+        pos += strlen("+COPS:");
+        if (!token) continue;
+        std::string rest = token + strlen("+COPS:");
+        size_t comma = rest.find(',');
+        long parsed = -1;
+        if (!parse_long_token(trim(rest.substr(0, comma)), parsed) || parsed < 0 || parsed > 4) continue;
+        mode = static_cast<int>(parsed);
+        selected_operator = first_quoted(line);
+        found = true;
+    }
+    return found;
 }
 
 // 注意：都要解析"包含 token 的那一行"。CEREG=2 的 URC 可能与查询响应混在同一段，
@@ -879,6 +935,7 @@ static esp_err_t send_at_locked(const std::string& cmd, uint32_t timeout_ms,
             }
         }
     }
+    observe_modem_ready_urc(response);
     preserve_sms_urc_from_response(response);
     return ret;
 }
@@ -976,6 +1033,7 @@ static bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms,
 
     auto consume = [&](const char* data, size_t len) {
         for (size_t i = 0; i < len; ++i) {
+            if (error && complete) break;
             char ch = data[i];
             if (skipping_data) {
                 if (ch == '\n') {
@@ -987,7 +1045,13 @@ static bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms,
             if (ch == '\r' || ch == '\n') {
                 std::string line = trim(head);
                 if (!line.empty()) {
-                    if (starts_with(line, "+MHTTPURC: \"err\"")) {
+                    if (line == "+MATREADY") {
+                        s_modem_ready_urc_pending.store(true, std::memory_order_relaxed);
+                        result.message = "模组在蜂窝HTTP事务中重启，下载已终止";
+                        error = true;
+                        complete = true;
+                        skipping_data = false;
+                    } else if (starts_with(line, "+MHTTPURC: \"err\"")) {
                         parse_mhttp_head(line, http_id, result, complete, error);
                     } else if (append_next_sms_payload || starts_with(line, "+CMT:") || starts_with(line, "+CMTI:")) {
                         append_sms_urc_line(line);
@@ -1218,7 +1282,7 @@ static bool model_skips_cgact(void)
     if (status.model == "ML307Y") return true;
     std::string resp;
     if (!send_ok("AT+CGMM", 1000, &resp)) return false;
-    std::string model = first_payload_line(resp, "AT+CGMM");
+    std::string model = first_plain_payload_line(resp, "AT+CGMM");
     if (!model.empty()) {
         IdfModemStatus patch;
         patch.model = model;
@@ -1300,14 +1364,40 @@ static bool apply_configured_operator_once(const IdfSimSettingsView& cfg)
         idf_log_line("运营商 PLMN 非法，未下发 COPS");
         return false;
     }
-    std::string cmd = cfg.operatorPlmn.empty() ? "AT+COPS=0" : "AT+COPS=1,2,\"" + cfg.operatorPlmn + "\"";
     std::string resp;
-    esp_err_t err = idf_modem_send_at(cmd, 30000, resp);
+    if (xSemaphoreTake(s_at_mutex, pdMS_TO_TICKS(5500)) != pdTRUE) {
+        idf_log_line("运营商: AT 通道正忙，稍后重试选网设置");
+        return false;
+    }
+    if (!cfg.operatorPlmn.empty() && send_at_locked("AT+COPS=3,2", 3000, resp) != ESP_OK) {
+        xSemaphoreGive(s_at_mutex);
+        idf_log_line("运营商: 无法切换到数字格式读取当前 PLMN，暂不重复下发 COPS");
+        return false;
+    }
+    int mode = -1;
+    std::string selected_operator;
+    esp_err_t query_err = send_at_locked("AT+COPS?", 5000, resp);
+    if (query_err != ESP_OK || !parse_cops_selection(resp, mode, selected_operator)) {
+        xSemaphoreGive(s_at_mutex);
+        idf_log_line("运营商: 当前选网状态读取失败，暂不重复下发 COPS");
+        return false;
+    }
+    if ((cfg.operatorPlmn.empty() && mode == 0) ||
+        (!cfg.operatorPlmn.empty() && mode == 1 && selected_operator == cfg.operatorPlmn)) {
+        xSemaphoreGive(s_at_mutex);
+        return true;
+    }
+
+    std::string cmd = cfg.operatorPlmn.empty() ? "AT+COPS=0" : "AT+COPS=1,2,\"" + cfg.operatorPlmn + "\"";
+    resp.clear();
+    esp_err_t err = send_at_locked(cmd, 30000, resp);
+    xSemaphoreGive(s_at_mutex);
     if (cfg.operatorPlmn.empty()) {
-        idf_logf("运营商: 自动注册(COPS=0) %s", err == ESP_OK ? "成功" : "失败");
+        idf_logf("运营商: 自动选网命令(COPS=0) %s",
+                 err == ESP_OK ? "已接受，等待网络注册" : "未确认，稍后先查询当前模式");
     } else {
         idf_logf("运营商: 锁定 PLMN %s %s", cfg.operatorPlmn.c_str(),
-                 err == ESP_OK ? "成功" : "失败(可能不可达)");
+                 err == ESP_OK ? "命令已接受，等待网络注册" : "未确认(可能不可达)");
     }
     return err == ESP_OK;
 }
@@ -1357,9 +1447,11 @@ static bool process_sim_config_apply(void)
     uint32_t remaining = s_sim_config_apply_pending.load(std::memory_order_relaxed);
     if (remaining == 0) {
         s_sim_config_apply_failures = 0;
-        idf_log_line("蜂窝设置已与模组运行状态一致");
+        idf_log_line("蜂窝设置已应用；网络注册与PDP地址由状态检查继续确认");
     } else {
-        s_next_sim_config_apply = now + pdMS_TO_TICKS(MODEM_SIM_CONFIG_RETRY_GAP_MS);
+        // COPS 最长会阻塞 30 秒；必须从命令完成时重新计时，不能用调用前的旧 now。
+        // 否则一次超时返回后 deadline 已经过期，200ms 后会立刻重发并打断选网。
+        s_next_sim_config_apply = xTaskGetTickCount() + pdMS_TO_TICKS(MODEM_SIM_CONFIG_RETRY_GAP_MS);
         if (attempted) {
             ++s_sim_config_apply_failures;
             if (s_sim_config_apply_failures == 1 || (s_sim_config_apply_failures % 6) == 0) {
@@ -1553,15 +1645,15 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
 
     // 固件/厂家信息基本不变；启动采样未完整前允许补采，完整后不再反复查询。
     if (need_static && before.mfr.empty()) {
-        if (send_ok("AT+CGMI", 1000, &resp)) patch.mfr = first_payload_line(resp, "AT+CGMI");
+        if (send_ok("AT+CGMI", 1000, &resp)) patch.mfr = first_plain_payload_line(resp, "AT+CGMI");
         vTaskDelay(pdMS_TO_TICKS(150));
     }
     if (need_static && before.model.empty()) {
-        if (send_ok("AT+CGMM", 1000, &resp)) patch.model = first_payload_line(resp, "AT+CGMM");
+        if (send_ok("AT+CGMM", 1000, &resp)) patch.model = first_plain_payload_line(resp, "AT+CGMM");
         vTaskDelay(pdMS_TO_TICKS(150));
     }
     if (need_static && before.fwver.empty()) {
-        if (send_ok("AT+CGMR", 1000, &resp)) patch.fwver = first_payload_line(resp, "AT+CGMR");
+        if (send_ok("AT+CGMR", 1000, &resp)) patch.fwver = first_plain_payload_line(resp, "AT+CGMR");
         vTaskDelay(pdMS_TO_TICKS(150));
     }
 
@@ -1579,14 +1671,22 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
     }
 
     auto parse_iccid_response = [](const std::string& raw) {
-        std::string line = first_payload_line(raw);
-        size_t p = line.find(':');
-        std::string value = trim(p == std::string::npos ? line : line.substr(p + 1));
-        value.erase(std::remove(value.begin(), value.end(), '"'), value.end());
-        for (char& ch : value) {
-            ch = static_cast<char>(toupper(static_cast<unsigned char>(ch)));
+        size_t pos = 0;
+        while (pos < raw.size()) {
+            size_t end = raw.find('\n', pos);
+            if (end == std::string::npos) end = raw.size();
+            std::string line = trim(raw.substr(pos, end - pos));
+            pos = end + 1;
+            if (!line_is_payload(line, nullptr) || line == "+MATREADY") continue;
+            size_t colon = line.find(':');
+            std::string value = trim(colon == std::string::npos ? line : line.substr(colon + 1));
+            value.erase(std::remove(value.begin(), value.end(), '"'), value.end());
+            for (char& ch : value) {
+                ch = static_cast<char>(toupper(static_cast<unsigned char>(ch)));
+            }
+            if (is_iccid_text(value)) return value;
         }
-        return is_iccid_text(value) ? value : std::string();
+        return std::string();
     };
     if (before.iccid.size() < 15) {
         const char* iccid_cmds[] = {"AT+MCCID", "AT+ICCID", "AT+CCID"};
@@ -1805,21 +1905,23 @@ void idf_modem_reassert_sms_storage(void)
     select_sms_storage();
 }
 
-static void configure_sms_and_registration(void)
+static bool configure_sms_and_registration(void)
 {
-    send_ok("ATE0", 1000);
-    send_ok("AT+CMGF=0", 1200);
+    bool ready = send_ok("ATE0", 1000);
+    ready = send_ok("AT+CMGF=0", 1200) && ready;
     // 统一收/存/读的短信存储位置：CNMI mt=1 投递到 <mem3>，CMGL/CMGR 读 <mem1>，
     // 两者不一致时 +CMTI 索引和补收轮询会看不同的存储，短信被静默丢失
     s_sms_storage_pending = !select_sms_storage();
-    send_ok("AT+CNMI=2,1,0,0,0", 1200);
-    send_ok("AT+CEREG=2", 1200);
+    ready = send_ok("AT+CNMI=2,1,0,0,0", 1200) && ready;
+    ready = send_ok("AT+CEREG=2", 1200) && ready;
     // 开启主叫号码上报：来电时模组主动上报 RING + +CLIP: "号码",...，供来电通知使用。
     // 无语音能力的卡/模组下该指令可能 ERROR，忽略即可(收不到来电就不会有 URC)。
     send_ok("AT+CLIP=1", 1200);
     // NET 指示灯开关(ML307R: AT+MLED=0,<0/1>)：每次初始化按保存的配置下发，
     // 覆盖模组记住的上次状态
     send_ok(idf_config_net_led_enabled() ? "AT+MLED=0,1" : "AT+MLED=0,0", 1200);
+    if (!ready) idf_log_line("短信/注册关键配置未完全生效，保留后台补初始化请求");
+    return ready;
 }
 
 // 仅明确的“未插卡”响应才改变热插拔状态；AT 忙、超时或 SIM 临时错误都保持未知，
@@ -1844,17 +1946,27 @@ static int query_sim_presence(void)
 // (ATE0/CMGF/CNMI/CEREG/CGACT)。否则模组以默认配置运行——回显开着、URC 不上报、
 // 数据连接按模组默认自动激活(产生流量费，恰是本项目要防止的)。
 static bool s_reinit_pending = false;
+static TickType_t s_next_reinit_retry = 0;
 
-static void handle_reset_request_if_any(void)
+static void set_reinit_result(bool configured)
+{
+    s_reinit_pending = !configured;
+    if (!configured) {
+        s_next_reinit_retry = xTaskGetTickCount() + pdMS_TO_TICKS(MODEM_REINIT_RETRY_GAP_MS);
+    }
+}
+
+static int handle_reset_request_if_any(void)
 {
     int request = s_reset_request.exchange(0, std::memory_order_relaxed);
-    if (request == 0) return;
+    if (request == 0) return 0;
 
     IdfModemStatus patch;
     patch.phase = "powering";
     patch.atReady = false;
     patch.modemReady = false;
     update_status(patch);
+    set_status_cell_ip("");
     reset_identity_sampling_state();
     if (request == 2) {
         idf_log_line("执行模组硬重启");
@@ -1869,7 +1981,7 @@ static void handle_reset_request_if_any(void)
         set_phase("failed");
         idf_log_line("模组重启后 AT 握手失败，等待恢复后补跑初始化");
         s_reinit_pending = true;
-        return;
+        return request;
     }
     patch = {};
     patch.started = true;
@@ -1877,19 +1989,28 @@ static void handle_reset_request_if_any(void)
     patch.modemReady = false;
     patch.phase = "at_ready";
     update_status(patch);
-    configure_sms_and_registration();
-    set_phase("registering");
+    // 丢弃本次预期重启在握手期间产生的 MATREADY；初始化开始后的新 MATREADY 必须保留。
+    s_modem_ready_urc_pending.store(false, std::memory_order_relaxed);
     apply_startup_data_mode();
+    bool configured = configure_sms_and_registration();
+    set_phase("registering");
+    sample_identity_once(false, false);
     request_sim_config_apply(SIM_APPLY_OPERATOR | SIM_APPLY_DATA);
-    s_reinit_pending = false;
+    set_reinit_result(configured);
+    return request;
 }
 
 // AT 恢复后的补初始化（配合 s_reinit_pending）
-static void run_pending_reinit_if_recovered(void)
+static bool run_pending_reinit_if_recovered(void)
 {
-    if (!s_reinit_pending) return;
-    if (!at_channel_idle_now()) return;
-    if (!send_ok("AT", 700)) return;
+    if (!s_reinit_pending) return false;
+    TickType_t now = xTaskGetTickCount();
+    if (static_cast<int32_t>(now - s_next_reinit_retry) < 0) return false;
+    if (!at_channel_idle_now()) return false;
+    if (!send_ok("AT", 700)) {
+        s_next_reinit_retry = xTaskGetTickCount() + pdMS_TO_TICKS(MODEM_REINIT_RETRY_GAP_MS);
+        return false;
+    }
     idf_log_line("模组 AT 已恢复，补跑短信/注册/数据配置");
     IdfModemStatus patch;
     patch.started = true;
@@ -1897,11 +2018,14 @@ static void run_pending_reinit_if_recovered(void)
     patch.modemReady = false;
     patch.phase = "at_ready";
     update_status(patch);
-    configure_sms_and_registration();
-    set_phase("registering");
+    s_modem_ready_urc_pending.store(false, std::memory_order_relaxed);
     apply_startup_data_mode();
+    bool configured = configure_sms_and_registration();
+    set_phase("registering");
+    sample_identity_once(false, false);
     request_sim_config_apply(SIM_APPLY_OPERATOR | SIM_APPLY_DATA);
-    s_reinit_pending = false;
+    set_reinit_result(configured);
+    return true;
 }
 
 static void modem_task(void*)
@@ -1962,15 +2086,26 @@ static void modem_task(void*)
     ESP_LOGI(TAG, "AT 已就绪");
     idf_log_line("模组 AT 已就绪");
 
-    configure_sms_and_registration();
-
-    set_phase("registering");
+    s_modem_ready_urc_pending.store(false, std::memory_order_relaxed);
     apply_startup_data_mode();
-    IdfSimSettingsView startup_cfg = idf_config_get_sim_settings_view();
-    if (!startup_cfg.operatorPlmn.empty()) {
-        request_sim_config_apply(SIM_APPLY_OPERATOR);
-        process_sim_config_apply();
+    bool configured = configure_sms_and_registration();
+    set_reinit_result(configured);
+    int sim_present = query_sim_presence();
+    if (sim_present == 1) {
+        idf_log_line("SIM 卡已就绪");
+    } else if (sim_present == 0) {
+        idf_log_line("未检测到 SIM 卡");
+    } else {
+        idf_log_line("SIM 卡状态暂时无法确认");
     }
+    // 厂家/型号/固件、IMEI、ICCID、IMSI 都不依赖蜂窝网络注册。
+    // 先读取这些字段，避免 CEREG 失败时 WebUI 把 UART/SIM 也误显示为“未刷新”。
+    sample_identity_once(false, false);
+    sample_signal_once();
+    set_phase("registering");
+    // 自动和锁定 PLMN 都先查询当前 COPS 模式，再决定是否需要下发变更。
+    request_sim_config_apply(SIM_APPLY_OPERATOR);
+    process_sim_config_apply();
 
     int check_count = 0;
     int stat = -1;
@@ -1989,7 +2124,8 @@ static void modem_task(void*)
     bool registered = (stat == 1 || stat == 5);
     bool post_register_done = false;
     if (!registered) {
-        set_phase("failed");
+        set_phase("registering");
+        idf_logf("蜂窝网络尚未注册(CEREG=%d)，保持模组在线继续等待", stat);
     } else {
         retry_sms_storage_if_pending();
         request_sim_config_apply(SIM_APPLY_DATA);
@@ -2008,11 +2144,32 @@ static void modem_task(void*)
     TickType_t last_health = 0;
     int health_fail_count = 0;
     int dereg_count = 0;
+    bool ever_registered = registered;
+    bool hard_recovery_attempted = false;
     TickType_t last_sim_check = 0;
-    int sim_present = -1;  // -1=未知(仅记基线) 0=无卡 1=有卡
     while (true) {
-        handle_reset_request_if_any();
-        run_pending_reinit_if_recovered();
+        bool modem_restarted = false;
+        if (s_modem_ready_urc_pending.exchange(false, std::memory_order_relaxed)) {
+            idf_log_line("检测到模组重启完成(+MATREADY)，补跑初始化而不再次断电");
+            s_reinit_pending = true;
+            s_next_reinit_retry = 0;
+            reset_identity_sampling_state();
+            set_status_cell_ip("");
+            set_phase("at_ready");
+            modem_restarted = true;
+        }
+        int handled_reset = handle_reset_request_if_any();
+        if (handled_reset != 0) modem_restarted = true;
+        if (handled_reset == 2) hard_recovery_attempted = true;
+        if (run_pending_reinit_if_recovered()) modem_restarted = true;
+        if (modem_restarted) {
+            registered = false;
+            post_register_done = false;
+            dereg_count = 0;
+            last_health = xTaskGetTickCount();
+            last_sim_check = 0;
+            sim_present = -1;
+        }
         TickType_t now = xTaskGetTickCount();
         if (process_sim_config_apply()) {
             vTaskDelay(pdMS_TO_TICKS(200));
@@ -2064,6 +2221,8 @@ static void modem_task(void*)
                 update_status(reg_patch);
                 if (now_ready) {
                     registered = true;
+                    ever_registered = true;
+                    hard_recovery_attempted = false;
                     dereg_count = 0;
                     if (!post_register_done) {
                         // 迟到/恢复的注册也要补跑必须的网络配置和首页基础信息。
@@ -2081,18 +2240,34 @@ static void modem_task(void*)
                 } else {
                     registered = false;
                     post_register_done = false;
-                    // AT 正常但长时间未注册(射频卡死/SIM 掉网)：这是 Arduino 版"3 天后只发不收"
-                    // 的经典故障形态，累计 5 次(约 5 分钟)后硬重启自愈
-                    if (++dereg_count >= 5) {
+                    set_status_cell_ip("");
+                    sample_signal_once();
+                    // 冷启动从未注册可能只是慢搜网、无卡或被拒绝；反复断电会把选网进度清零。
+                    // 仅对“本次启动曾注册成功、随后持续掉网”做一次恢复，重新注册后才重新武装。
+                    if (ever_registered && !hard_recovery_attempted) {
+                        if (++dereg_count >= 5) {
+                            dereg_count = 0;
+                            hard_recovery_attempted = true;
+                            idf_logf("模组已掉网约5分钟(CEREG=%d)，执行一次硬重启恢复", stat);
+                            s_reset_request.store(2, std::memory_order_relaxed);
+                        }
+                    } else {
                         dereg_count = 0;
-                        idf_log_line("模组长时间未注册网络，触发硬重启恢复");
-                        s_reset_request.store(2, std::memory_order_relaxed);
                     }
                 }
-            } else if (++health_fail_count >= 3) {
-                health_fail_count = 0;
-                idf_log_line("模组健康探测连续失败，触发硬重启恢复");
-                s_reset_request.store(2, std::memory_order_relaxed);
+            } else {
+                std::string at_resp;
+                if (send_ok("AT", 700, &at_resp)) {
+                    idf_log_line("CEREG 状态读取暂时失败，但模组 AT 通信正常，保持在线观察");
+                    health_fail_count = 0;
+                } else if (!hard_recovery_attempted && ++health_fail_count >= 3) {
+                    health_fail_count = 0;
+                    hard_recovery_attempted = true;
+                    idf_log_line("模组 AT 健康探测连续失败，执行一次硬重启恢复");
+                    s_reset_request.store(2, std::memory_order_relaxed);
+                } else if (hard_recovery_attempted) {
+                    health_fail_count = 0;
+                }
             }
         }
         // SIM 热插拔检测：低频轮询 AT+CPIN?，识别运行中插卡/拔卡。
@@ -2104,16 +2279,23 @@ static void modem_task(void*)
             int present_now = query_sim_presence();
             if (present_now < 0) continue;
             if (sim_present == -1) {
-                sim_present = present_now;  // 首次仅记基线，不当作插拔事件
+                sim_present = present_now;
+                idf_log_line(present_now == 1 ? "SIM 卡已就绪" : "未检测到 SIM 卡");
             } else if (present_now != sim_present) {
                 sim_present = present_now;
                 if (present_now == 1) {
                     idf_log_line("检测到 SIM 卡插入，重新初始化模组");
-                    configure_sms_and_registration();
+                    if (!configure_sms_and_registration()) {
+                        s_reinit_pending = true;
+                        s_next_reinit_retry = xTaskGetTickCount() + pdMS_TO_TICKS(MODEM_REINIT_RETRY_GAP_MS);
+                    }
                     idf_modem_invalidate_sim_identity();
+                    sample_identity_once(false, false);
                     request_sim_config_apply(SIM_APPLY_OPERATOR | SIM_APPLY_DATA);
                     registered = false;
                     post_register_done = false;
+                    ever_registered = false;
+                    hard_recovery_attempted = false;
                     dereg_count = 0;
                     last_health = 0;  // 下一轮立即重查 CEREG，尽快感知新卡注册
                     set_phase("registering");
@@ -2121,6 +2303,8 @@ static void modem_task(void*)
                     idf_log_line("检测到 SIM 卡移除");
                     registered = false;
                     post_register_done = false;
+                    ever_registered = false;
+                    hard_recovery_attempted = false;
                     idf_modem_invalidate_sim_identity();
                     set_phase("registering");
                 }
@@ -2269,6 +2453,7 @@ void idf_modem_invalidate_sim_identity(void)
         s_status.phone.clear();
         s_status.operatorName.clear();
         s_status.apnSim.clear();
+        s_status.cellIp.clear();
         s_status.identityFresh = false;
         xSemaphoreGive(s_status_mutex);
     }
