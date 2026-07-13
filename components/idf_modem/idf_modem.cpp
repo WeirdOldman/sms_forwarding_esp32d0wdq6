@@ -40,6 +40,7 @@ static constexpr uint32_t CELLULAR_HTTP_TIMEOUT_MS = 90000UL;
 static constexpr uint32_t CELLULAR_PDP_READY_TIMEOUT_MS = 12000UL;
 static constexpr uint32_t MODEM_SIM_CONFIG_RETRY_GAP_MS = 10000UL;
 static constexpr uint32_t MODEM_REINIT_RETRY_GAP_MS = 5000UL;
+static constexpr uint32_t MODEM_READY_SETTLE_MS = 5000UL;
 static constexpr uint32_t IDENTITY_RETRY_INTERVAL_MS = 600000UL;
 // AT 就绪后立即读取静态/SIM身份；信号和运营商等网络字段仍在注册后或网页刷新时采样。
 // 后续采样受 at_channel_idle 门控，不与收发/保号抢 AT 通道。
@@ -1331,18 +1332,23 @@ static void request_sim_config_apply(uint32_t flags)
 
 static void apply_startup_data_mode(void)
 {
+    IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
+    if (cfg.dataEnabled) {
+        // ML307R 在尚未注册时执行 CGACT=1 可能长时间阻塞，且会与选网/射频启动争用。
+        // 启用数据只记录目标，等 CEREG=1/5 后由收敛任务激活 PDP。
+        idf_log_line("已配置启用蜂窝数据，等待网络注册后再激活PDP");
+        request_sim_config_apply(SIM_APPLY_DATA);
+        return;
+    }
     if (model_skips_cgact()) {
         idf_log_line("该型号跳过启动 CGACT 配置");
         return;
     }
-    IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
     bool ok = apply_configured_data_mode_once(cfg, 6000, 2500);
     if (ok) {
-        idf_log_line(cfg.dataEnabled ? "启动阶段已下发蜂窝数据配置，注册后将再次确认"
-                                     : "启动阶段已下发数据禁用配置，注册后将再次确认");
+        idf_log_line("启动阶段已下发数据禁用配置，注册后将再次确认");
     } else {
-        idf_log_line(cfg.dataEnabled ? "启动时激活数据连接未成功，保留后台收敛请求"
-                                     : "启动时禁用数据连接未确认，保留后台收敛请求");
+        idf_log_line("启动时禁用数据连接未确认，保留后台收敛请求");
     }
     // 注册过程可能改变 PDP 状态；无论启动阶段是否成功，注册后都必须再次核对。
     request_sim_config_apply(SIM_APPLY_DATA);
@@ -2150,9 +2156,9 @@ static void modem_task(void*)
     while (true) {
         bool modem_restarted = false;
         if (s_modem_ready_urc_pending.exchange(false, std::memory_order_relaxed)) {
-            idf_log_line("检测到模组重启完成(+MATREADY)，补跑初始化而不再次断电");
+            idf_log_line("检测到模组重启完成(+MATREADY)，等待稳定后补跑初始化");
             s_reinit_pending = true;
-            s_next_reinit_retry = 0;
+            s_next_reinit_retry = xTaskGetTickCount() + pdMS_TO_TICKS(MODEM_READY_SETTLE_MS);
             reset_identity_sampling_state();
             set_status_cell_ip("");
             set_phase("at_ready");
@@ -2167,8 +2173,15 @@ static void modem_task(void*)
             post_register_done = false;
             dereg_count = 0;
             last_health = xTaskGetTickCount();
-            last_sim_check = 0;
+            last_sim_check = xTaskGetTickCount();
             sim_present = -1;
+        }
+        if (s_reinit_pending) {
+            // MATREADY 后的稳定窗口内只收集后续 URC，不允许 COPS/CGACT/身份采样插入。
+            // 若模组再次重启，下一轮会重新计算静默窗口，直到 AT 真正稳定。
+            poll_unsolicited_uart(20);
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
         }
         TickType_t now = xTaskGetTickCount();
         if (process_sim_config_apply()) {
