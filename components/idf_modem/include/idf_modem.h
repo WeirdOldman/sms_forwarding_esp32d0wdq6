@@ -52,6 +52,7 @@ esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::st
 esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uint32_t timeout_ms, std::string& response);
 esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint32_t timeout_ms, std::string& response);
 esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularHttpConfig& config, IdfCellularHttpResult& result);
+// hard_reset=false 使用 AT+CFUN=1,1；true 通过 GPIO27/EN 执行断电上电周期。
 esp_err_t idf_modem_request_reset(bool hard_reset);
 // 配置保存、SIM 热插拔或 eSIM 切换后请求模组任务收敛运行态；失败会保留请求并后台重试。
 void idf_modem_request_sim_config_apply(bool operator_changed, bool data_changed);
@@ -74,7 +75,5 @@ void idf_modem_invalidate_sim_identity(void);
 // 注册"卡身份已变化"通知钩子(热插拔/eSIM 切换均触发)，供上层失效自身缓存(如 eSIM EID)。
 // 钩子可能在模组任务上下文被调用，实现必须无阻塞。
 void idf_modem_set_sim_identity_hook(void (*hook)(void));
-// 计划内 ESP 重启(网页重启/每日定时重启/低堆重启)前调用：拉低 EN 让模组彻底断电，
-// 重启后走全新上电。保留"重启设备可救活 AT 正常但收信已死的模组"的原有语义；
-// 热启动快路径只服务于崩溃/看门狗等意外复位
+// 计划内 ESP32 重启前将 GPIO27/EN 拉低并保持足够断电时间。
 void idf_modem_power_off_for_restart(void);

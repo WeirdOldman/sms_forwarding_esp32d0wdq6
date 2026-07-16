@@ -1040,8 +1040,8 @@ static esp_err_t handle_modem_control(httpd_req_t* req)
     std::string message;
 
     WebModemActionGuard modem_action;
-    bool needs_modem = (action == "restart" || action == "hardreset" ||
-                        action == "signal" || action == "operator" || action == "imei");
+    bool needs_modem = (action == "restart" || action == "hardreset" || action == "signal" ||
+                        action == "operator" || action == "imei");
     if ((action == "restart" || action == "hardreset") && req->method != HTTP_POST) {
         set_json_no_cache(req);
         return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"模组重启需要 POST\"}");
@@ -1054,7 +1054,8 @@ static esp_err_t handle_modem_control(httpd_req_t* req)
         success = (err == ESP_OK);
         if (success) idf_logf("网页触发模组%s重启", hard ? "硬" : "软");
         message = success
-            ? (hard ? "正在硬重启模组，请等待约 15 秒后刷新页面" : "正在软重启模组，请等待约 15 秒后刷新页面")
+            ? (hard ? "正在通过 GPIO27/EN 硬重启模组，请等待约 15 秒后刷新页面"
+                    : "正在通过 AT 重启模组，请等待约 15 秒后刷新页面")
             : esp_err_to_name(err);
     } else if (action == "signal") {
         std::string resp;
@@ -1171,6 +1172,11 @@ static void parse_push_channels_form(const IdfFormFields& fields,
 {
     for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
         char key[24];
+        snprintf(key, sizeof(key), "push%ddelete", i);
+        if (has_field(fields, key)) {
+            channels[i] = IdfPushChannel{};
+            continue;
+        }
         snprintf(key, sizeof(key), "push%den", i);
         channels[i].enabled = has_field(fields, key);
         snprintf(key, sizeof(key), "push%dtype", i);
@@ -1480,8 +1486,6 @@ static esp_err_t handle_import_config(httpd_req_t* req)
 static void restart_task(void*)
 {
     vTaskDelay(pdMS_TO_TICKS(1200));
-    // 计划内重启先给模组断电：保留"重启设备可救活已卡死模组"的原有语义，
-    // 模组热启动快路径只留给崩溃/看门狗等意外复位
     idf_modem_power_off_for_restart();
     esp_restart();
 }
@@ -3062,7 +3066,6 @@ static void scheduler_task(void*)
                 rb_last_day = day;
                 idf_log_line("每日定时重启...");
                 vTaskDelay(pdMS_TO_TICKS(300));
-                // 每日重启是无人值守设备的兜底自愈手段，必须连模组一起冷启动
                 idf_modem_power_off_for_restart();
                 esp_restart();
             }

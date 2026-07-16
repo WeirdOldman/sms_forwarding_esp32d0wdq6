@@ -31,7 +31,7 @@ python tools\build_web_assets.py --check
 
 CI builds the ESP-IDF firmware via `.github/workflows/build.yml`.
 
-This fork tracks `MineSunshineone/sms_forwarding` while keeping one classic ESP32 hardware profile: target `esp32`, UART1 TX/RX on GPIO17/GPIO16, modem EN on GPIO27, and the provisioning button on GPIO32. Do not restore ESP32-C3 pins or bootloader offsets when syncing upstream.
+This fork tracks `MineSunshineone/sms_forwarding` while keeping one classic ESP32 hardware profile: target `esp32`, UART1 TX/RX on GPIO17/GPIO16, ML307 EN driven active-high by GPIO27, and the provisioning button on GPIO32. ML307 EN must not also be tied to +5V. Do not restore ESP32-C3 pins/GPIO5 or bootloader offsets when syncing upstream.
 
 ## Architecture
 

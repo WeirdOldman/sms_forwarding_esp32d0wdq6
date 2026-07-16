@@ -43,6 +43,7 @@ static constexpr uint32_t SMS_POLL_INTERVAL_MS = 60000;
 static constexpr uint32_t SMS_STARTUP_POLL_INTERVAL_MS = 8000;
 static constexpr uint32_t SMS_STARTUP_FAST_WINDOW_MS = 120000;
 static constexpr uint8_t SMS_CNMI_REASSERT_EVERY = 5;
+// 与最新上游一致：+CMGS 网络终态最多等待 60 秒；超时后不自动重发。
 static constexpr uint32_t SMS_SEND_TIMEOUT_MS = 60000;
 
 struct ConcatPart {
@@ -279,11 +280,7 @@ static void admin_reset_task(void*)
     while ((idf_push_email_queue_depth() > 0 || idf_push_busy()) && esp_timer_get_time() < deadline) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-    idf_modem_request_reset(true);
-    vTaskDelay(pdMS_TO_TICKS(1500));
     idf_log_line("正在重启ESP32...");
-    // RESET 命令语义是"模组+ESP32 都彻底重启"：确保模组断电后再重启 ESP，
-    // 避免热启动快路径把它当健康模组沿用
     idf_modem_power_off_for_restart();
     esp_restart();
 }
@@ -356,6 +353,7 @@ static bool process_admin_command(const std::string& sender, const std::string& 
     idf_push_enqueue_email("重启命令已执行", "收到RESET命令，即将重启模组和ESP32...");
     if (xTaskCreate(admin_reset_task, "admin_reset", 3072, nullptr, 3, nullptr) != pdPASS) {
         idf_log_line("RESET任务创建失败，直接重启ESP32");
+        idf_modem_power_off_for_restart();
         esp_restart();
     }
     return true;
@@ -1235,6 +1233,38 @@ static esp_err_t sms_encode_one(const std::string& phone, const std::string& bod
     return ESP_OK;
 }
 
+static std::string sms_response_error_line(const std::string& response)
+{
+    static const char* kTokens[] = {"+CMS ERROR", "+CME ERROR", "ERROR"};
+    size_t pos = 0;
+    while (pos < response.size()) {
+        size_t end = response.find('\n', pos);
+        if (end == std::string::npos) end = response.size();
+        std::string line = trim(response.substr(pos, end - pos));
+        for (const char* token : kTokens) {
+            if (line.find(token) != std::string::npos) return line;
+        }
+        pos = end + 1;
+    }
+    return {};
+}
+
+static std::string sms_submit_failure_detail(esp_err_t err, const std::string& response)
+{
+    std::string error_line = sms_response_error_line(response);
+    if (!error_line.empty()) return error_line;
+    if (err == ESP_ERR_NOT_FINISHED) return "模组 AT 通道正忙，本条尚未提交";
+    if (err == ESP_ERR_INVALID_SIZE) return "短信 PDU 的 UART 写入不完整";
+    if (err == ESP_ERR_TIMEOUT) {
+        if (response.find('>') != std::string::npos) {
+            return "短信提交超时（已提交 PDU，但模组未返回 +CMGS/OK，发送结果未知）";
+        }
+        return "等待短信输入提示符超时（PDU 尚未提交）";
+    }
+    if (err == ESP_OK) return "模组响应格式异常";
+    return esp_err_to_name(err);
+}
+
 esp_err_t idf_sms_send_text(const std::string& phone_raw, const std::string& text_raw, std::string& message)
 {
     message.clear();
@@ -1274,7 +1304,21 @@ esp_err_t idf_sms_send_text(const std::string& phone_raw, const std::string& tex
         if (csms == 0) csms = s_csms_ref.fetch_add(1, std::memory_order_relaxed);
     }
 
-    esp_err_t err = ESP_OK;
+    // 换卡或模组协议栈复位可能把 CMGF 恢复为文本模式；每次发送前重申 PDU 模式。
+    std::string mode_resp;
+    esp_err_t err = idf_modem_send_at("AT+CMGF=0", 3000, mode_resp);
+    if (err != ESP_OK) {
+        message = "无法恢复短信 PDU 模式: " + sms_submit_failure_detail(err, mode_resp);
+        idf_sent_add(phone.c_str(), text.c_str(), false);
+        if (err == ESP_ERR_NOT_FINISHED) {
+            idf_logf("发送前模组 AT 通道正忙，本条未提交且不重启模组: %s", message.c_str());
+        } else {
+            idf_logf("发送前短信模式配置失败，触发模组 EN 硬重启: %s", message.c_str());
+            idf_modem_request_reset(true);
+        }
+        return err;
+    }
+
     for (size_t i = 0; i < parts.size(); ++i) {
         std::string sms_pdu;
         int pdu_len = -1;
@@ -1292,9 +1336,7 @@ esp_err_t idf_sms_send_text(const std::string& phone_raw, const std::string& tex
         std::string resp;
         err = idf_modem_send_pdu(cmd, sms_pdu.c_str(), SMS_SEND_TIMEOUT_MS, resp);
         if (err != ESP_OK) {
-            std::string failure = err == ESP_ERR_TIMEOUT
-                ? "短信发送响应超时"
-                : (resp.empty() ? std::string(esp_err_to_name(err)) : trim(resp));
+            std::string failure = sms_submit_failure_detail(err, resp);
             if (parts.size() > 1) {
                 char buf[96];
                 snprintf(buf, sizeof(buf), "长短信第 %u/%u 段发送失败: %s",
@@ -1303,6 +1345,14 @@ esp_err_t idf_sms_send_text(const std::string& phone_raw, const std::string& tex
                 message = buf;
             } else {
                 message = failure;
+            }
+            if (err == ESP_ERR_TIMEOUT || err == ESP_ERR_INVALID_SIZE) {
+                // Ctrl+Z 后超时是结果不确定态，不自动重发，避免重复扣费/送达。
+                // ML307 的 CFUN 软重启会反复上报 MATREADY；用 EN 做一次干净电源周期。
+                idf_log_line(err == ESP_ERR_TIMEOUT
+                    ? "短信提交超时，触发模组 EN 硬重启恢复短信通道；本条不自动重发"
+                    : "短信 PDU 写入不完整，触发模组 EN 硬重启恢复短信通道；本条未标记成功");
+                idf_modem_request_reset(true);
             }
             idf_sent_add(phone.c_str(), text.c_str(), false);
             idf_logf("网页发送短信失败: %s", message.c_str());
